@@ -1,0 +1,51 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Ferramentas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Segredos
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Bancos de dados locais e logs (podem conter conteúdo de documentos)
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# Documentos: bloqueados por padrão; exceção só para amostras sintéticas ou públicas
+*.pdf
+!data/sintetico/**/*.pdf
+!data/publico/**/*.pdf
+
+# Pastas de documentos reais (nunca versionar)
+data/real/
+data/privado/
+
+# Saídas de avaliação brutas podem conter trechos de documentos; revise antes de versionar
+evaluation/results/**/*.raw.*
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+
+# Documentos de referência locais (não versionados)
+docs/
