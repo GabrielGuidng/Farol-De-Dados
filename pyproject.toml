@@ -1,0 +1,46 @@
+[project]
+name = "farol-de-dados"
+version = "0.1.0"
+description = "Apoio à auditoria de cobranças contratuais com motor determinístico e agentes de IA."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.8",
+    "streamlit>=1.40",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    # Previstas (adicionar quando o passo do roadmap chegar; ver .regras/decisoes.md):
+    # leitor de PDF (PyMuPDF ou pdfplumber), lxml, defusedxml, SDK do provedor de modelo.
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+python_files = ["test_*.py"]
+markers = ["llm: usa a API real de modelo de linguagem (fora da suíte padrão)"]
+addopts = "-ra --strict-markers -m 'not llm'"
+filterwarnings = ["ignore::DeprecationWarning:langsmith.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "ANN", "B", "UP", "BLE", "S110"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]
+
+[tool.ruff.format]
+quote-style = "double"
