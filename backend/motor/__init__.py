@@ -9,22 +9,29 @@ from backend.motor.calculator import (
     subtract_money,
 )
 from backend.motor.results import (
+    ContractValidityResult,
     Reason,
     ReasonCode,
     RuleSelection,
     SelectionStatus,
     TimelineResult,
+    ValidityStatus,
 )
 from backend.motor.timeline import apply_amendments, select_applicable_rule
+from backend.motor.validity import check_contract_validity, effective_contract_end
 
 __all__ = [
+    "ContractValidityResult",
     "Reason",
     "ReasonCode",
     "RuleSelection",
     "SelectionStatus",
     "TimelineResult",
+    "ValidityStatus",
     "add_money",
     "apply_amendments",
+    "check_contract_validity",
+    "effective_contract_end",
     "multiply_money",
     "percentage",
     "require_decimal",
