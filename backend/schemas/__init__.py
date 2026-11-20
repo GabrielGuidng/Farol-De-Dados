@@ -19,6 +19,7 @@ from backend.schemas.enums import (
     most_severe,
 )
 from backend.schemas.evidence import Evidence
+from backend.schemas.invoice import BillingItem, Invoice
 from backend.schemas.periods import ReferencePeriod, ValidityPeriod
 from backend.schemas.rules import Amendment, ContractRule
 from backend.schemas.types import (
@@ -34,6 +35,7 @@ __all__ = [
     "CLASSIFICATION_SEVERITY_ORDER",
     "Amendment",
     "AuditClassification",
+    "BillingItem",
     "CheckResult",
     "Cnpj",
     "Contract",
@@ -42,6 +44,7 @@ __all__ = [
     "Document",
     "DocumentType",
     "Evidence",
+    "Invoice",
     "InvoiceSource",
     "Money",
     "PlainDate",
