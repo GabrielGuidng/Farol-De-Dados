@@ -20,6 +20,7 @@ from backend.schemas.enums import (
 )
 from backend.schemas.evidence import Evidence
 from backend.schemas.periods import ReferencePeriod, ValidityPeriod
+from backend.schemas.rules import Amendment, ContractRule
 from backend.schemas.types import (
     Money,
     PlainDate,
@@ -31,10 +32,12 @@ from backend.schemas.types import (
 
 __all__ = [
     "CLASSIFICATION_SEVERITY_ORDER",
+    "Amendment",
     "AuditClassification",
     "CheckResult",
     "Cnpj",
     "Contract",
+    "ContractRule",
     "ContractStatus",
     "Document",
     "DocumentType",
