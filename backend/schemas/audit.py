@@ -9,6 +9,7 @@ from backend.schemas.base import StrictModel
 from backend.schemas.enums import (
     AuditClassification,
     CheckResult,
+    DivergenceDirection,
     ReviewDecision,
     ReviewStatus,
     ReviewTargetType,
@@ -28,6 +29,7 @@ class Check(StrictModel):
 
     name: NonEmptyStr
     result: CheckResult
+    direction: DivergenceDirection | None = None
     message: NonEmptyStr
     calculation_memory: tuple[str, ...] = ()
     rule_id: EntityId | None = None

@@ -107,6 +107,15 @@ class CheckResult(StrEnum):
     PENDING = "PENDING"
 
 
+class DivergenceDirection(StrEnum):
+    """Direcao ou situacao da comparacao quando ha divergencia ou revisao."""
+
+    OVERCHARGE = "OVERCHARGE"
+    UNDERCHARGE = "UNDERCHARGE"
+    POSSIBLE_DIVERGENCE = "POSSIBLE_DIVERGENCE"
+    UNVERIFIABLE = "UNVERIFIABLE"
+
+
 class ReviewTargetType(StrEnum):
     """Tipo do objeto alvo de uma revisao humana."""
 
