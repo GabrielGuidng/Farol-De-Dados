@@ -8,8 +8,11 @@ from backend.motor.calculator import (
     round_money,
     subtract_money,
 )
+from backend.motor.checks import check_monthly_price
 from backend.motor.results import (
+    CheckOutcome,
     ContractValidityResult,
+    DivergenceDirection,
     Reason,
     ReasonCode,
     RuleSelection,
@@ -21,7 +24,9 @@ from backend.motor.timeline import apply_amendments, select_applicable_rule
 from backend.motor.validity import check_contract_validity, effective_contract_end
 
 __all__ = [
+    "CheckOutcome",
     "ContractValidityResult",
+    "DivergenceDirection",
     "Reason",
     "ReasonCode",
     "RuleSelection",
@@ -31,6 +36,7 @@ __all__ = [
     "add_money",
     "apply_amendments",
     "check_contract_validity",
+    "check_monthly_price",
     "effective_contract_end",
     "multiply_money",
     "percentage",
