@@ -4,12 +4,18 @@ from datetime import date
 
 from backend.motor import (
     ReasonCode,
+    SelectionStatus,
     apply_amendments,
+    select_applicable_rule,
 )
-from backend.schemas import RuleRelation
+from backend.schemas import ReferencePeriod, ReviewStatus, RuleRelation, RuleType
 from tests.fixtures.scenario import base_rules, dev_amendments, make_amendment, make_rule
 
 JAN = date(2026, 1, 1)
+
+
+def period(text: str) -> ReferencePeriod:
+    return ReferencePeriod.model_validate(text)
 
 
 def by_id(rules, rule_id):
@@ -100,3 +106,122 @@ def test_duplicate_rule_id_is_reported() -> None:
     result = apply_amendments(rules, [])
     assert {issue.code for issue in result.issues} == {ReasonCode.DUPLICATE_RULE_ID}
     assert len(result.rules) == 3
+
+
+def test_m01_case_b_april_selects_base_rule_not_the_latest() -> None:
+    timeline = apply_amendments(base_rules(), dev_amendments())
+    prices = [rule for rule in timeline.rules if rule.rule_type is RuleType.MONTHLY_PRICE]
+    selection = select_applicable_rule(prices, period("2026-04"))
+    assert selection.status is SelectionStatus.SELECTED
+    assert selection.rule is not None and selection.rule.id == "price-base"
+
+
+def test_m01_case_b_also_holds_without_timeline_reconstruction() -> None:
+    prices = [
+        make_rule("base", value="10000", start=JAN),
+        make_rule("add01", value="10800", start=date(2026, 5, 1)),
+    ]
+    selection = select_applicable_rule(prices, period("2026-04"))
+    assert selection.rule is not None and selection.rule.id == "base"
+
+
+def test_m01_each_month_selects_the_expected_amendment() -> None:
+    timeline = apply_amendments(base_rules(), dev_amendments())
+    prices = [rule for rule in timeline.rules if rule.rule_type is RuleType.MONTHLY_PRICE]
+    expected = {
+        "2026-04": "price-base",
+        "2026-05": "price-add01",
+        "2026-08": "price-add01",
+        "2026-09": "price-add02",
+        "2026-10": "price-add02",
+        "2026-12": "price-add02",
+    }
+    for text, rule_id in expected.items():
+        selection = select_applicable_rule(prices, period(text))
+        assert selection.rule is not None and selection.rule.id == rule_id, text
+
+
+def test_m05_same_start_and_different_values_selects_none() -> None:
+    rules = [
+        make_rule("a", value="10000", start=JAN),
+        make_rule("b", value="11000", start=JAN),
+    ]
+    selection = select_applicable_rule(rules, period("2026-04"))
+    assert selection.status is SelectionStatus.NEEDS_REVIEW
+    assert selection.rule is None
+    assert selection.reasons[0].code is ReasonCode.CONFLICT
+    assert set(selection.reasons[0].rule_ids) == {"a", "b"}
+
+
+def test_overlapping_rules_with_same_terms_are_not_a_conflict() -> None:
+    rules = [make_rule("a", value="10000", start=JAN), make_rule("b", value="10000.00", start=JAN)]
+    selection = select_applicable_rule(rules, period("2026-04"))
+    assert selection.status is SelectionStatus.SELECTED
+
+
+def test_m09_rule_starting_mid_period_needs_review() -> None:
+    rules = [
+        make_rule("old", value="10000", start=JAN, end=date(2026, 5, 14)),
+        make_rule("new", value="10800", start=date(2026, 5, 15)),
+    ]
+    selection = select_applicable_rule(rules, period("2026-05"))
+    assert selection.status is SelectionStatus.NEEDS_REVIEW
+    assert selection.rule is None
+    assert [reason.code for reason in selection.reasons] == [ReasonCode.MID_PERIOD_CHANGE]
+
+
+def test_m09_rule_ending_mid_period_needs_review() -> None:
+    rules = [make_rule("old", value="10000", start=JAN, end=date(2026, 5, 20))]
+    selection = select_applicable_rule(rules, period("2026-05"))
+    assert selection.status is SelectionStatus.NEEDS_REVIEW
+    assert selection.reasons[0].code is ReasonCode.MID_PERIOD_CHANGE
+
+
+def test_m09_end_on_last_day_and_start_on_first_day_are_not_mid_period() -> None:
+    rules = [
+        make_rule("old", value="10000", start=JAN, end=date(2026, 4, 30)),
+        make_rule("new", value="10800", start=date(2026, 5, 1)),
+    ]
+    assert select_applicable_rule(rules, period("2026-04")).rule.id == "old"
+    assert select_applicable_rule(rules, period("2026-05")).rule.id == "new"
+
+
+def test_no_applicable_rule_returns_empty_result_with_reason() -> None:
+    rules = [make_rule("old", value="10000", start=JAN, end=date(2026, 3, 31))]
+    selection = select_applicable_rule(rules, period("2026-06"))
+    assert selection.status is SelectionStatus.NO_RULE
+    assert selection.rule is None
+    assert selection.reasons[0].code is ReasonCode.NO_APPLICABLE_RULE
+    assert select_applicable_rule([], period("2026-06")).status is SelectionStatus.NO_RULE
+
+
+def test_unknown_start_date_is_not_presumed() -> None:
+    selection = select_applicable_rule([make_rule("a", value="10000")], period("2026-06"))
+    assert selection.status is SelectionStatus.NEEDS_REVIEW
+    assert selection.reasons[0].code is ReasonCode.MISSING_START_DATE
+
+
+def test_rejected_rules_are_ignored() -> None:
+    rules = [
+        make_rule("good", value="10000", start=JAN),
+        make_rule("bad", value="99999", start=JAN, status=ReviewStatus.REJECTED),
+    ]
+    assert select_applicable_rule(rules, period("2026-06")).rule.id == "good"
+
+
+def test_pending_rule_is_selected_but_keeps_its_status() -> None:
+    rules = [make_rule("a", value="10000", start=JAN, status=ReviewStatus.PENDING_REVIEW)]
+    selection = select_applicable_rule(rules, period("2026-06"))
+    assert selection.rule is not None
+    assert selection.rule.review_status is ReviewStatus.PENDING_REVIEW
+
+
+def test_mixed_rule_types_are_a_usage_error() -> None:
+    import pytest
+
+    rules = [
+        make_rule("a", value="1", start=JAN),
+        make_rule("b", RuleType.FRANCHISE, quantity="40", start=JAN),
+    ]
+    with pytest.raises(ValueError):
+        select_applicable_rule(rules, period("2026-06"))

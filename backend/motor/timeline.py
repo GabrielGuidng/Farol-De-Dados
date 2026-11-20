@@ -3,10 +3,12 @@
 from collections.abc import Sequence
 from datetime import date, timedelta
 
-from backend.motor.results import Reason, ReasonCode, TimelineResult
+from backend.motor.results import Reason, ReasonCode, RuleSelection, SelectionStatus, TimelineResult
 from backend.schemas import (
     Amendment,
     ContractRule,
+    ReferencePeriod,
+    ReviewStatus,
     RuleRelation,
     ValidityPeriod,
 )
@@ -157,3 +159,108 @@ def apply_amendments(
     for amendment in _unique_amendments(amendments, issues):
         _apply_one(current, amendment, issues)
     return TimelineResult(rules=tuple(current.values()), issues=tuple(issues))
+
+
+def _terms(rule: ContractRule) -> tuple[object, ...]:
+    return (
+        rule.value,
+        rule.quantity,
+        rule.unit,
+        rule.adjustment_index,
+        rule.periodicity_months,
+    )
+
+
+def _clipped(rule: ContractRule, period: ReferencePeriod) -> tuple[date, date]:
+    start = rule.validity.start
+    end = rule.validity.end
+    first = period.first_day if start is None else max(start, period.first_day)
+    last = period.last_day if end is None else min(end, period.last_day)
+    return first, last
+
+
+def select_applicable_rule(
+    rules: Sequence[ContractRule], reference_period: ReferencePeriod
+) -> RuleSelection:
+    """
+    Recebe as regras de um tipo e a competência; devolve a regra cuja vigência cobre o mês inteiro.
+    Conflito, mudança no meio da competência ou início desconhecido: NEEDS_REVIEW (não levanta).
+    Regras REJECTED são ignoradas; tipos misturados são erro de uso (ValueError).
+    """
+    if len({rule.rule_type for rule in rules}) > 1:
+        raise ValueError("select_applicable_rule exige regras de um único tipo")
+    period = reference_period
+    candidates: list[ContractRule] = []
+    for rule in rules:
+        start, end = rule.validity.start, rule.validity.end
+        if rule.review_status is ReviewStatus.REJECTED:
+            continue
+        if end is not None and end < period.first_day:
+            continue
+        if start is not None and start > period.last_day:
+            continue
+        candidates.append(rule)
+    if not candidates:
+        return RuleSelection(
+            status=SelectionStatus.NO_RULE,
+            reasons=(
+                _reason(
+                    ReasonCode.NO_APPLICABLE_RULE,
+                    f"Nenhuma regra vigente para a competência {period}.",
+                ),
+            ),
+        )
+
+    reasons: list[Reason] = []
+    conflicting: list[str] = []
+    for index, left in enumerate(candidates):
+        left_start, left_end = _clipped(left, period)
+        for right in candidates[index + 1 :]:
+            right_start, right_end = _clipped(right, period)
+            overlap = max(left_start, right_start) <= min(left_end, right_end)
+            if overlap and _terms(left) != _terms(right):
+                conflicting.extend(rule_id for rule_id in (left.id, right.id))
+    if conflicting:
+        ids = tuple(dict.fromkeys(conflicting))
+        reasons.append(
+            _reason(
+                ReasonCode.CONFLICT,
+                f"Regras com valores diferentes e vigências sobrepostas na competência {period}, "
+                f"sem vínculo de substituição: {', '.join(ids)}.",
+                *ids,
+            )
+        )
+    partial = [
+        rule
+        for rule in candidates
+        if rule.validity.start is not None
+        and not (
+            rule.validity.start <= period.first_day
+            and (rule.validity.end is None or rule.validity.end >= period.last_day)
+        )
+    ]
+    if partial:
+        ids = tuple(rule.id for rule in partial)
+        reasons.append(
+            _reason(
+                ReasonCode.MID_PERIOD_CHANGE,
+                f"A vigência de uma regra começa ou termina dentro da competência {period} "
+                "e não há pró-rata definido.",
+                *ids,
+            )
+        )
+    unknown_start = [rule for rule in candidates if rule.validity.start is None]
+    if unknown_start:
+        ids = tuple(rule.id for rule in unknown_start)
+        reasons.append(
+            _reason(
+                ReasonCode.MISSING_START_DATE,
+                "A regra não informa a data de início da vigência; o sistema não presume uma data.",
+                *ids,
+            )
+        )
+    if reasons:
+        return RuleSelection(status=SelectionStatus.NEEDS_REVIEW, reasons=tuple(reasons))
+    return RuleSelection(
+        status=SelectionStatus.SELECTED, rule=min(candidates, key=lambda rule: rule.id)
+    )
