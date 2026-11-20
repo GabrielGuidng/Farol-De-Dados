@@ -17,6 +17,7 @@ from backend.schemas.enums import (
     RuleType,
     most_severe,
 )
+from backend.schemas.periods import ReferencePeriod, ValidityPeriod
 from backend.schemas.types import (
     Money,
     PlainDate,
@@ -38,6 +39,7 @@ __all__ = [
     "PlainDate",
     "Quantity",
     "ReadQuality",
+    "ReferencePeriod",
     "ReviewDecision",
     "ReviewStatus",
     "ReviewTargetType",
@@ -46,6 +48,7 @@ __all__ = [
     "SignedMoney",
     "StrictModel",
     "UnitPrice",
+    "ValidityPeriod",
     "VerificationScore",
     "is_valid_cnpj",
     "most_severe",
