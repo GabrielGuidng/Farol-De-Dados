@@ -8,6 +8,9 @@ import pytest
 from backend.motor import (
     apply_amendments,
     check_monthly_price,
+    check_overage,
+    check_overage_price,
+    check_overage_quantity,
     select_applicable_rule,
 )
 from backend.motor.results import RuleSelection, SelectionStatus
@@ -135,3 +138,121 @@ def test_checks_reject_float_and_wrong_rule_type() -> None:
     overage = select(ReviewStatus.CONFIRMED, RuleType.OVERAGE_PRICE, "2026-10")
     with pytest.raises(ValueError):
         check_monthly_price(Decimal("1"), overage, ZERO)
+
+
+def overage_selections(status: ReviewStatus = ReviewStatus.CONFIRMED, text: str = "2026-07"):
+    return (
+        select(status, RuleType.FRANCHISE, text),
+        select(status, RuleType.OVERAGE_PRICE, text),
+    )
+
+
+def test_m04_eight_hours_billed_with_six_permitted_points_300_more() -> None:
+    franchise, price = overage_selections()
+    outcome = check_overage_quantity(Decimal("8"), Decimal("46"), franchise, price, ZERO)
+    assert outcome.check.result is CheckResult.DIVERGENCE
+    assert outcome.direction is DivergenceDirection.OVERCHARGE
+    assert outcome.difference == Decimal("300.00")
+    assert outcome.base == Decimal("900.00")
+    memory = outcome.check.calculation_memory
+    assert "horas permitidas = máx(0, 46 − 40) = 6" in memory
+    assert "valor a mais = 2 × R$ 150,00 = R$ 300,00" in memory
+
+
+def test_m04_overage_price_matches_hours_times_price() -> None:
+    _, price = overage_selections()
+    outcome = check_overage_price(Decimal("8"), Decimal("1200.00"), price, ZERO)
+    assert outcome.check.result is CheckResult.OK
+    assert outcome.direction is None
+    assert outcome.base == Decimal("1200.00")
+
+
+def test_m04_overage_price_mismatch_is_divergence() -> None:
+    _, price = overage_selections()
+    outcome = check_overage_price(Decimal("8"), Decimal("1300.00"), price, ZERO)
+    assert outcome.check.result is CheckResult.DIVERGENCE
+    assert outcome.direction is DivergenceDirection.OVERCHARGE
+    assert outcome.difference == Decimal("100.00")
+    under = check_overage_price(Decimal("8"), Decimal("1100.00"), price, ZERO)
+    assert under.check.result is CheckResult.DIVERGENCE
+    assert under.direction is DivergenceDirection.UNDERCHARGE
+
+
+def test_m04_overage_without_measurement_needs_review() -> None:
+    franchise, price = overage_selections(text="2026-11")
+    outcome = check_overage_quantity(Decimal("3"), None, franchise, price, ZERO)
+    assert outcome.check.result is CheckResult.REVIEW
+    assert outcome.direction is DivergenceDirection.UNVERIFIABLE
+    assert "sem medição" in outcome.check.message
+
+
+def test_m04_hours_within_the_permitted_amount_are_ok() -> None:
+    franchise, price = overage_selections()
+    outcome = check_overage_quantity(Decimal("6"), Decimal("46"), franchise, price, ZERO)
+    assert outcome.check.result is CheckResult.OK
+    assert outcome.direction is None
+    assert outcome.difference == ZERO
+
+
+def test_m04_measurement_below_franchise_permits_zero_hours() -> None:
+    franchise, price = overage_selections()
+    outcome = check_overage_quantity(Decimal("2"), Decimal("38"), franchise, price, ZERO)
+    assert outcome.check.result is CheckResult.DIVERGENCE
+    assert outcome.direction is DivergenceDirection.OVERCHARGE
+    assert outcome.difference == Decimal("300.00")
+    assert "máx(0, 38 − 40) = 0" in outcome.check.calculation_memory[2]
+
+
+def test_m04_no_overage_billed_needs_no_selection_or_measurement() -> None:
+    empty = RuleSelection(status=SelectionStatus.NO_RULE)
+    price = check_overage_price(Decimal("0"), Decimal("0.00"), empty, ZERO)
+    quantity = check_overage_quantity(Decimal("0"), None, empty, empty, ZERO)
+    assert price.check.result is CheckResult.OK
+    assert quantity.check.result is CheckResult.OK
+
+
+def test_m04_pending_rules_cap_overage_divergence_at_review() -> None:
+    franchise, price = overage_selections(ReviewStatus.PENDING_REVIEW)
+    outcome = check_overage_quantity(Decimal("8"), Decimal("46"), franchise, price, ZERO)
+    assert outcome.check.result is CheckResult.REVIEW
+    assert outcome.direction is DivergenceDirection.POSSIBLE_DIVERGENCE
+    assert "possível divergência" in outcome.check.message.lower()
+    price_outcome = check_overage_price(Decimal("8"), Decimal("1300.00"), price, ZERO)
+    assert price_outcome.check.result is CheckResult.REVIEW
+    assert price_outcome.direction is DivergenceDirection.POSSIBLE_DIVERGENCE
+
+
+def test_m04_one_untrusted_rule_is_enough_to_cap_at_review() -> None:
+    franchise = select(ReviewStatus.CONFIRMED, RuleType.FRANCHISE, "2026-07")
+    price = select(ReviewStatus.PENDING_REVIEW, RuleType.OVERAGE_PRICE, "2026-07")
+    outcome = check_overage_quantity(Decimal("8"), Decimal("46"), franchise, price, ZERO)
+    assert outcome.check.result is CheckResult.REVIEW
+
+
+def test_dev_scenario_invoice_103_combines_price_and_quantity_checks() -> None:
+    franchise, price = overage_selections()
+    price_outcome, quantity_outcome = check_overage(
+        Decimal("8"), Decimal("1200.00"), Decimal("46"), franchise, price, ZERO
+    )
+    assert price_outcome.check.result is CheckResult.OK
+    assert quantity_outcome.check.result is CheckResult.DIVERGENCE
+    assert quantity_outcome.difference == Decimal("300.00")
+
+
+def test_dev_scenario_invoice_108_without_measurement_is_review() -> None:
+    franchise, price = overage_selections(text="2026-11")
+    price_outcome, quantity_outcome = check_overage(
+        Decimal("3"), Decimal("450.00"), None, franchise, price, ZERO
+    )
+    assert price_outcome.check.result is CheckResult.OK
+    assert quantity_outcome.check.result is CheckResult.REVIEW
+
+
+def test_overage_checks_reject_float() -> None:
+    franchise, price = overage_selections()
+    with pytest.raises(TypeError):
+        check_overage_quantity(8.0, Decimal("46"), franchise, price, ZERO)
+    with pytest.raises(TypeError):
+        check_overage_quantity(Decimal("8"), 46.0, franchise, price, ZERO)
+    with pytest.raises(TypeError):
+        check_overage_price(Decimal("8"), 1200.0, price, ZERO)

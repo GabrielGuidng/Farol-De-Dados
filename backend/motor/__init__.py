@@ -8,7 +8,12 @@ from backend.motor.calculator import (
     round_money,
     subtract_money,
 )
-from backend.motor.checks import check_monthly_price
+from backend.motor.checks import (
+    check_monthly_price,
+    check_overage,
+    check_overage_price,
+    check_overage_quantity,
+)
 from backend.motor.results import (
     CheckOutcome,
     ContractValidityResult,
@@ -37,6 +42,9 @@ __all__ = [
     "apply_amendments",
     "check_contract_validity",
     "check_monthly_price",
+    "check_overage",
+    "check_overage_price",
+    "check_overage_quantity",
     "effective_contract_end",
     "multiply_money",
     "percentage",
