@@ -17,6 +17,7 @@ from backend.schemas.enums import (
     RuleType,
     most_severe,
 )
+from backend.schemas.evidence import Evidence
 from backend.schemas.periods import ReferencePeriod, ValidityPeriod
 from backend.schemas.types import (
     Money,
@@ -34,6 +35,7 @@ __all__ = [
     "Cnpj",
     "ContractStatus",
     "DocumentType",
+    "Evidence",
     "InvoiceSource",
     "Money",
     "PlainDate",
