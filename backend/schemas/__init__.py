@@ -2,6 +2,7 @@
 
 from backend.schemas.base import StrictModel
 from backend.schemas.cnpj import Cnpj, is_valid_cnpj, normalize_cnpj
+from backend.schemas.contract import Contract, Document
 from backend.schemas.enums import (
     CLASSIFICATION_SEVERITY_ORDER,
     AuditClassification,
@@ -33,7 +34,9 @@ __all__ = [
     "AuditClassification",
     "CheckResult",
     "Cnpj",
+    "Contract",
     "ContractStatus",
+    "Document",
     "DocumentType",
     "Evidence",
     "InvoiceSource",
