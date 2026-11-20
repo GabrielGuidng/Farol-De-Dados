@@ -1,5 +1,6 @@
 """Contratos de dados Pydantic: nada passa entre modulos sem ser validado aqui."""
 
+from backend.schemas.audit import AppliedRule, AuditResult, Check, HumanReview
 from backend.schemas.base import StrictModel
 from backend.schemas.cnpj import Cnpj, is_valid_cnpj, normalize_cnpj
 from backend.schemas.contract import Contract, Document
@@ -34,8 +35,11 @@ from backend.schemas.types import (
 __all__ = [
     "CLASSIFICATION_SEVERITY_ORDER",
     "Amendment",
+    "AppliedRule",
     "AuditClassification",
+    "AuditResult",
     "BillingItem",
+    "Check",
     "CheckResult",
     "Cnpj",
     "Contract",
@@ -44,6 +48,7 @@ __all__ = [
     "Document",
     "DocumentType",
     "Evidence",
+    "HumanReview",
     "Invoice",
     "InvoiceSource",
     "Money",
