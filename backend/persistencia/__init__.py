@@ -1,5 +1,6 @@
 """Camada de persistência SQLite: esquema, repositórios, decisões, snapshots e hash."""
 
+from backend.persistencia.audits import StoredAudit, get_audit, list_audits, save_audit
 from backend.persistencia.database import SCHEMA_SQL, TABLE_NAMES, connect, init_db
 from backend.persistencia.repositories import (
     get_amendment,
@@ -29,15 +30,18 @@ from backend.persistencia.reviews import (
 __all__ = [
     "SCHEMA_SQL",
     "TABLE_NAMES",
+    "StoredAudit",
     "append_review",
     "connect",
     "get_amendment",
+    "get_audit",
     "get_contract",
     "get_document",
     "get_invoice",
     "get_rule",
     "init_db",
     "list_amendments",
+    "list_audits",
     "list_contracts",
     "list_documents",
     "list_invoices",
@@ -47,6 +51,7 @@ __all__ = [
     "record_document_review",
     "record_rule_review",
     "save_amendment",
+    "save_audit",
     "save_contract",
     "save_document",
     "save_invoice",
