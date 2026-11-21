@@ -2,6 +2,11 @@
 
 from backend.persistencia.audits import StoredAudit, get_audit, list_audits, save_audit
 from backend.persistencia.database import SCHEMA_SQL, TABLE_NAMES, connect, init_db
+from backend.persistencia.hashing import (
+    compute_sha256,
+    receive_document,
+    verify_document_integrity,
+)
 from backend.persistencia.repositories import (
     get_amendment,
     get_contract,
@@ -32,6 +37,7 @@ __all__ = [
     "TABLE_NAMES",
     "StoredAudit",
     "append_review",
+    "compute_sha256",
     "connect",
     "get_amendment",
     "get_audit",
@@ -47,6 +53,7 @@ __all__ = [
     "list_invoices",
     "list_reviews",
     "list_rules",
+    "receive_document",
     "record_audit_review",
     "record_document_review",
     "record_rule_review",
@@ -56,4 +63,5 @@ __all__ = [
     "save_document",
     "save_invoice",
     "save_rule",
+    "verify_document_integrity",
 ]
