@@ -14,6 +14,12 @@ from backend.motor.checks import (
     check_overage_price,
     check_overage_quantity,
 )
+from backend.motor.items import (
+    ItemClassification,
+    check_item_classification,
+    check_items_total,
+    classify_items,
+)
 from backend.motor.results import (
     CheckOutcome,
     ContractValidityResult,
@@ -25,13 +31,20 @@ from backend.motor.results import (
     TimelineResult,
     ValidityStatus,
 )
-from backend.motor.timeline import apply_amendments, select_applicable_rule
-from backend.motor.validity import check_contract_validity, effective_contract_end
+from backend.motor.timeline import (
+    apply_amendments,
+    select_applicable_rule,
+)
+from backend.motor.validity import (
+    check_contract_validity,
+    effective_contract_end,
+)
 
 __all__ = [
     "CheckOutcome",
     "ContractValidityResult",
     "DivergenceDirection",
+    "ItemClassification",
     "Reason",
     "ReasonCode",
     "RuleSelection",
@@ -41,10 +54,13 @@ __all__ = [
     "add_money",
     "apply_amendments",
     "check_contract_validity",
+    "check_item_classification",
+    "check_items_total",
     "check_monthly_price",
     "check_overage",
     "check_overage_price",
     "check_overage_quantity",
+    "classify_items",
     "effective_contract_end",
     "multiply_money",
     "percentage",

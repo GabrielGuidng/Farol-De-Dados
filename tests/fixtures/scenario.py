@@ -1,11 +1,14 @@
 """Construtores de cenários reutilizáveis para os testes do motor (ver testes.md, seção 4)."""
 
 from datetime import date
+from decimal import Decimal
 
 from backend.schemas import (
     Amendment,
+    BillingItem,
     Contract,
     ContractRule,
+    Invoice,
     ReviewStatus,
     RuleRelation,
     RuleType,
@@ -136,3 +139,57 @@ def dev_amendments(status: ReviewStatus = ReviewStatus.CONFIRMED) -> list[Amendm
         make_amendment("add01", "price-base", date(2026, 5, 1), add01),
         make_amendment("add02", "price-add01", date(2026, 9, 1), add02),
     ]
+
+
+def make_item(
+    description: str,
+    quantity: str,
+    unit_value: str,
+    total_value: str,
+    unit: str | None = None,
+) -> BillingItem:
+    return BillingItem(
+        description=description,
+        quantity=quantity,
+        unit=unit,
+        unit_value=unit_value,
+        total_value=total_value,
+    )
+
+
+def make_invoice(
+    invoice_id: str,
+    number: str,
+    period: str,
+    items: list[BillingItem],
+    *,
+    total: str | None = None,
+    measured_hours: str | None = None,
+    contract_id: str | None = "CT-2026-001",
+    inferred: bool = False,
+    cnpj: str = CNPJ,
+) -> Invoice:
+    items_total = sum((item.total_value for item in items), Decimal("0"))
+    return Invoice(
+        id=invoice_id,
+        contract_id=contract_id,
+        supplier="Fornecedor Exemplo",
+        supplier_cnpj=cnpj,
+        number=number,
+        issue_date=date(2027, 2, 1),
+        reference_period=period,
+        competence_inferred=inferred,
+        total=total if total is not None else items_total,
+        measured_hours=measured_hours,
+        source="PDF",
+        items=tuple(items),
+    )
+
+
+def monthly_item(amount: str) -> BillingItem:
+    return make_item("Mensalidade de suporte", "1", amount, amount, "mês")
+
+
+def overage_item(hours: str, unit_price: str = "150.00") -> BillingItem:
+    total = Decimal(hours) * Decimal(unit_price)
+    return make_item("Horas excedentes de suporte", hours, unit_price, str(total), "hora")
