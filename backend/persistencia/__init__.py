@@ -18,10 +18,18 @@ from backend.persistencia.repositories import (
     save_invoice,
     save_rule,
 )
+from backend.persistencia.reviews import (
+    append_review,
+    list_reviews,
+    record_audit_review,
+    record_document_review,
+    record_rule_review,
+)
 
 __all__ = [
     "SCHEMA_SQL",
     "TABLE_NAMES",
+    "append_review",
     "connect",
     "get_amendment",
     "get_contract",
@@ -33,7 +41,11 @@ __all__ = [
     "list_contracts",
     "list_documents",
     "list_invoices",
+    "list_reviews",
     "list_rules",
+    "record_audit_review",
+    "record_document_review",
+    "record_rule_review",
     "save_amendment",
     "save_contract",
     "save_document",
