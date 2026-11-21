@@ -32,6 +32,9 @@ class ReasonCode(StrEnum):
     ITEMS_TOTAL_MISMATCH = "ITEMS_TOTAL_MISMATCH"
     DUPLICATE_INVOICE = "DUPLICATE_INVOICE"
     ADJUSTMENT_DUE = "ADJUSTMENT_DUE"
+    UNREVIEWED_AMENDMENT = "UNREVIEWED_AMENDMENT"
+    INFERRED_COMPETENCE = "INFERRED_COMPETENCE"
+    MISSING_CONTRACT = "MISSING_CONTRACT"
 
 
 class Reason(StrictModel):
@@ -74,6 +77,13 @@ class TimelineResult(StrictModel):
     def complete(self) -> bool:
         """Falso se algum aditivo não pôde ser aplicado; nesse caso exige revisão humana."""
         return not self.issues
+
+
+class RuleConsolidation(StrictModel):
+    """Regras que entram na consolidação e o alerta sobre as que ficaram de fora."""
+
+    rules: tuple[ContractRule, ...]
+    check: Check
 
 
 class ValidityStatus(StrEnum):

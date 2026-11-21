@@ -19,6 +19,12 @@ from backend.motor.checks import (
     check_overage_price,
     check_overage_quantity,
 )
+from backend.motor.consolidation import (
+    check_amendment_review,
+    check_competence_inferred,
+    check_contract_link,
+    consolidate_rules,
+)
 from backend.motor.duplicates import (
     check_duplicates,
 )
@@ -34,6 +40,7 @@ from backend.motor.results import (
     DivergenceDirection,
     Reason,
     ReasonCode,
+    RuleConsolidation,
     RuleSelection,
     SelectionStatus,
     TimelineResult,
@@ -55,6 +62,7 @@ __all__ = [
     "ItemClassification",
     "Reason",
     "ReasonCode",
+    "RuleConsolidation",
     "RuleSelection",
     "SelectionStatus",
     "TimelineResult",
@@ -62,6 +70,9 @@ __all__ = [
     "add_money",
     "add_months",
     "apply_amendments",
+    "check_amendment_review",
+    "check_competence_inferred",
+    "check_contract_link",
     "check_contract_validity",
     "check_duplicates",
     "check_item_classification",
@@ -72,6 +83,7 @@ __all__ = [
     "check_overage_quantity",
     "check_periodic_adjustment",
     "classify_items",
+    "consolidate_rules",
     "effective_contract_end",
     "latest_due_adjustment",
     "multiply_money",

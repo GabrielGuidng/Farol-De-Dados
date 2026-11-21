@@ -1,6 +1,6 @@
 """Construtores de cenários reutilizáveis para os testes do motor (ver testes.md, seção 4)."""
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from backend.schemas import (
@@ -8,7 +8,10 @@ from backend.schemas import (
     BillingItem,
     Contract,
     ContractRule,
+    Document,
+    DocumentType,
     Invoice,
+    ReadQuality,
     ReviewStatus,
     RuleRelation,
     RuleType,
@@ -197,3 +200,25 @@ def monthly_item(amount: str) -> BillingItem:
 def overage_item(hours: str, unit_price: str = "150.00") -> BillingItem:
     total = Decimal(hours) * Decimal(unit_price)
     return make_item("Horas excedentes de suporte", hours, unit_price, str(total), "hora")
+
+
+def make_document(document_id: str, *, reviewed: bool = True) -> Document:
+    return Document(
+        id=document_id,
+        contract_id="CT-2026-001",
+        document_type=DocumentType.AMENDMENT,
+        file_name=f"{document_id}.pdf",
+        received_at=datetime(2026, 11, 1, 10, 0, 0),
+        file_hash="a" * 64,
+        read_quality=ReadQuality.OK,
+        reviewed=reviewed,
+        extracted_text="Texto do aditivo.",
+    )
+
+
+def dev_documents(*, reviewed: bool = True) -> list[Document]:
+    """Documentos dos dois aditivos do cenário (ids `doc-add01` e `doc-add02`)."""
+    return [
+        make_document("doc-add01", reviewed=reviewed),
+        make_document("doc-add02", reviewed=reviewed),
+    ]
