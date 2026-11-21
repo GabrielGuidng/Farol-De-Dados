@@ -222,3 +222,28 @@ def dev_documents(*, reviewed: bool = True) -> list[Document]:
         make_document("doc-add01", reviewed=reviewed),
         make_document("doc-add02", reviewed=reviewed),
     ]
+
+
+def dev_invoices() -> list[Invoice]:
+    """As 8 cobranças do cenário de desenvolvimento (testes.md, seção 4)."""
+    return [
+        make_invoice("inv-101", "101", "2026-04", [monthly_item("10000.00")], measured_hours="38"),
+        make_invoice("inv-102", "102", "2026-06", [monthly_item("10800.00")], measured_hours="40"),
+        make_invoice(
+            "inv-103",
+            "103",
+            "2026-07",
+            [monthly_item("10800.00"), overage_item("8")],
+            measured_hours="46",
+        ),
+        make_invoice("inv-104", "104", "2026-10", [monthly_item("10800.00")]),
+        make_invoice("inv-105", "105", "2026-08", [monthly_item("10800.00")], measured_hours="40"),
+        make_invoice("inv-106", "106", "2026-08", [monthly_item("10800.00")], measured_hours="40"),
+        make_invoice("inv-107", "107", "2027-01", [monthly_item("10500.00")]),
+        make_invoice(
+            "inv-108",
+            "108",
+            "2026-11",
+            [monthly_item("10500.00"), overage_item("3")],
+        ),
+    ]
