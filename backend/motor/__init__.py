@@ -14,6 +14,9 @@ from backend.motor.checks import (
     check_overage_price,
     check_overage_quantity,
 )
+from backend.motor.duplicates import (
+    check_duplicates,
+)
 from backend.motor.items import (
     ItemClassification,
     check_item_classification,
@@ -54,6 +57,7 @@ __all__ = [
     "add_money",
     "apply_amendments",
     "check_contract_validity",
+    "check_duplicates",
     "check_item_classification",
     "check_items_total",
     "check_monthly_price",
