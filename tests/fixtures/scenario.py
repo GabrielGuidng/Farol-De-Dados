@@ -30,6 +30,8 @@ def make_rule(
     page: int = 1,
     version: int = 1,
     excerpt: str = "Trecho literal de teste.",
+    index: str | None = None,
+    periodicity: int | None = None,
 ) -> ContractRule:
     return ContractRule.model_validate(
         {
@@ -38,6 +40,8 @@ def make_rule(
             "rule_type": rule_type,
             "value": value,
             "quantity": quantity,
+            "adjustment_index": index,
+            "periodicity_months": periodicity,
             "validity": {"start": start, "end": end},
             "review_status": status,
             "evidence": {

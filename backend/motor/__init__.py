@@ -1,5 +1,10 @@
 """Motor determinístico: vigência, cálculo e verificações, sem IA."""
 
+from backend.motor.adjustment import (
+    add_months,
+    check_periodic_adjustment,
+    latest_due_adjustment,
+)
 from backend.motor.calculator import (
     add_money,
     multiply_money,
@@ -55,6 +60,7 @@ __all__ = [
     "TimelineResult",
     "ValidityStatus",
     "add_money",
+    "add_months",
     "apply_amendments",
     "check_contract_validity",
     "check_duplicates",
@@ -64,8 +70,10 @@ __all__ = [
     "check_overage",
     "check_overage_price",
     "check_overage_quantity",
+    "check_periodic_adjustment",
     "classify_items",
     "effective_contract_end",
+    "latest_due_adjustment",
     "multiply_money",
     "percentage",
     "require_decimal",
