@@ -5,6 +5,10 @@ from backend.motor.adjustment import (
     check_periodic_adjustment,
     latest_due_adjustment,
 )
+from backend.motor.auditor import (
+    audit_invoice,
+    audit_invoices,
+)
 from backend.motor.calculator import (
     add_money,
     multiply_money,
@@ -70,6 +74,8 @@ __all__ = [
     "add_money",
     "add_months",
     "apply_amendments",
+    "audit_invoice",
+    "audit_invoices",
     "check_amendment_review",
     "check_competence_inferred",
     "check_contract_link",

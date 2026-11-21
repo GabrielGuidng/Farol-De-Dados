@@ -106,6 +106,19 @@ class CheckResult(StrEnum):
     DIVERGENCE = "DIVERGENCE"
     PENDING = "PENDING"
 
+    @property
+    def classification(self) -> AuditClassification:
+        """Classificacao correspondente (unico lugar do mapeamento resultado -> classificacao)."""
+        return _CHECK_RESULT_CLASSIFICATION[self]
+
+
+_CHECK_RESULT_CLASSIFICATION: dict[CheckResult, AuditClassification] = {
+    CheckResult.OK: AuditClassification.NO_DIVERGENCE,
+    CheckResult.REVIEW: AuditClassification.NEEDS_REVIEW,
+    CheckResult.DIVERGENCE: AuditClassification.DIVERGENCE,
+    CheckResult.PENDING: AuditClassification.MISSING_DOCUMENTATION,
+}
+
 
 class DivergenceDirection(StrEnum):
     """Direcao ou situacao da comparacao quando ha divergencia ou revisao."""
