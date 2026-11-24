@@ -2,6 +2,13 @@
 
 from backend.leitura._parsing import UnsafeXmlError
 from backend.leitura.docx_reader import DocxParagraph, DocxReadResult, read_docx
+from backend.leitura.masking import (
+    CPF_MASK,
+    RG_MASK,
+    MaskingResult,
+    mask_sensitive_data,
+    mask_text,
+)
 from backend.leitura.nfe import parse_nfe
 from backend.leitura.nfse import (
     NfseLayoutDetector,
@@ -23,9 +30,12 @@ from backend.leitura.spreadsheets import (
 )
 
 __all__ = [
+    "CPF_MASK",
     "DEFAULT_MIN_TEXT_CHARS",
+    "RG_MASK",
     "DocxParagraph",
     "DocxReadResult",
+    "MaskingResult",
     "MeasurementRecord",
     "NfseLayoutDetector",
     "NfseLayoutParser",
@@ -40,6 +50,8 @@ __all__ = [
     "import_measurements_spreadsheet",
     "import_measurements_xlsx",
     "list_nfse_layouts",
+    "mask_sensitive_data",
+    "mask_text",
     "parse_nfe",
     "parse_nfse",
     "read_docx",
