@@ -13,8 +13,8 @@ Situações possíveis: **Adotada**, **Prevista**, **Em aberto**, **Etapa poster
 | Orquestração com LangGraph | Adotada, como implementação de referência | O fluxo tem ramificação real e pausas para revisão humana; as funções dos nós não dependem da biblioteca. |
 | FastAPI | Prevista, após motor e schemas | Só se justifica ao desacoplar serviços; até lá o Streamlit pode chamar o núcleo. |
 | Persistência | SQLite no protótipo; PostgreSQL (JSONB) como evolução **(decisão)** | O protótipo pode ser simples e local. SQLite já vem com o Python. |
-| Leitura de PDF | **Em aberto** | PyMuPDF (licença AGPL, atenção em uso comercial) ou pdfplumber. |
-| DOCX | **Em aberto** | Converter para PDF (depende de LibreOffice instalado no sistema) ou ancorar a evidência por cláusula e parágrafo. |
+| Leitura de PDF | `pdfplumber` **(decisão adotada)** | Licença MIT (sem risco AGPL do PyMuPDF); extração de texto página a página. |
+| DOCX | Ancorar por cláusula e parágrafo **(decisão adotada)** | Dispensa conversão para PDF e LibreOffice; evidência marcada com `without_page=True`. |
 | OCR | Etapa posterior **(decisão)** | Até lá, documentos sem camada de texto são sinalizados e não processados. |
 | Provedor de modelo | **Em aberto** | Verificar retenção e uso para treinamento antes de qualquer dado real. Configurável por `LLM_MODEL`, atrás de `LLMClient`. |
 | Comunicação Streamlit e backend | **Em aberto** | Via API FastAPI ou chamando o núcleo diretamente. |
@@ -31,8 +31,8 @@ Situações possíveis: **Adotada**, **Prevista**, **Em aberto**, **Etapa poster
 
 | Dependência | Passo do roadmap | Observação |
 |---|---|---|
-| Leitor de PDF (PyMuPDF ou pdfplumber) | 6 (leitura) | Ver decisão "Leitura de PDF". |
-| `lxml` e `defusedxml` | 6 (leitura) | Leitura segura de XML de NF-e. |
+| `pdfplumber` e `python-docx` | 6 (leitura — **adicionadas**) | Leitura de PDF por página e DOCX por cláusula/parágrafo. |
+| `defusedxml` e `openpyxl` | 6 (leitura — **adicionadas**) | Leitura segura de XML de NF-e/NFS-e e planilhas `.xlsx`. |
 | SDK do provedor de modelo | 7 (agentes) | Depois da decisão do provedor. |
-| LibreOffice (sistema, não Python) | 6 (leitura) | Só se a decisão de DOCX for converter para PDF. |
+| LibreOffice (sistema, não Python) | Descartado **(decisão)** | Não é necessário com ancoragem direta por cláusula e parágrafo em DOCX. |
 

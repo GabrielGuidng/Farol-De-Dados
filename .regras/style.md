@@ -14,6 +14,7 @@ backend/
   agentes/      # extração com modelo de linguagem + prompts.py
   schemas/      # modelos Pydantic (contratos de dados)
   persistencia/ # repositório (SQLite) e registro de decisões em modo de acréscimo
+  leitura/      # leitura de PDF, DOCX, XML (NF-e/NFS-e), planilhas e mascaramento
   api/          # rotas FastAPI
 frontend/       # Streamlit
 tests/
@@ -23,7 +24,7 @@ evaluation/     # conjuntos de avaliação e scripts (fora da suíte pytest padr
 data/           # SOMENTE documentos públicos ou sintéticos (ver agente.md, seção 4)
 ```
 
-Regra de dependência: `motor` não importa `agentes`. O motor recebe dados já validados e nunca sabe de onde vieram. `agentes` não importa `motor`. `persistencia` depende apenas de `schemas`.
+Regra de dependência: `motor` não importa `agentes`. O motor recebe dados já validados e nunca sabe de onde vieram. `agentes` não importa `motor`. `persistencia` depende apenas de `schemas`. `leitura` depende apenas de `schemas`.
 
 ## 2. Tipagem Obrigatória e Contratos de Dados
 

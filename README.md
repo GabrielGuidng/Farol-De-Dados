@@ -88,8 +88,8 @@ Itens ainda não fixados. Registre cada decisão em [`.regras/decisoes.md`](.reg
 
 | Tema | Situação |
 |---|---|
-| Leitura de PDF | A definir. PyMuPDF (licença AGPL, atenção em uso comercial) ou pdfplumber. |
-| DOCX | Converter para PDF antes da leitura (para ancorar a evidência por página) ou ancorar por cláusula e parágrafo. A definir a ferramenta de conversão. |
+| Leitura de PDF | Adotada: `pdfplumber` (licença MIT). |
+| DOCX | Adotada: ancoragem por cláusula e parágrafo, sem conversão para PDF. |
 | OCR para PDFs escaneados | Etapa posterior. Até lá, documentos sem camada de texto são sinalizados e não processados. |
 | Provedor e modelo de linguagem | A definir. Configurável por variável de ambiente, atrás de uma interface (`LLMClient`); verificar retenção e treinamento antes de usar dados reais. |
 | Comunicação Streamlit e backend | A definir: via API FastAPI ou chamando o núcleo diretamente. |
@@ -107,6 +107,7 @@ farol-de-dados/
 │   ├── agentes/       # Agentes de IA, verificação de ancoragem e prompts versionados
 │   ├── schemas/       # Modelos Pydantic estritos
 │   ├── persistencia/  # Repositório (SQLite) e registro de decisões em modo de acréscimo
+│   ├── leitura/       # Leitura de PDF, DOCX, XML (NF-e/NFS-e), planilhas e mascaramento
 │   └── api/           # Endpoints FastAPI
 ├── frontend/          # Interface em Streamlit
 ├── tests/
