@@ -12,17 +12,33 @@ from backend.leitura.nfse import (
     register_nfse_layout,
 )
 from backend.leitura.pdf import DEFAULT_MIN_TEXT_CHARS, PdfPage, PdfReadResult, read_pdf
+from backend.leitura.spreadsheets import (
+    MeasurementRecord,
+    import_invoices_csv,
+    import_invoices_spreadsheet,
+    import_invoices_xlsx,
+    import_measurements_csv,
+    import_measurements_spreadsheet,
+    import_measurements_xlsx,
+)
 
 __all__ = [
     "DEFAULT_MIN_TEXT_CHARS",
     "DocxParagraph",
     "DocxReadResult",
+    "MeasurementRecord",
     "NfseLayoutDetector",
     "NfseLayoutParser",
     "PdfPage",
     "PdfReadResult",
     "UnsafeXmlError",
     "detect_nfse_layout",
+    "import_invoices_csv",
+    "import_invoices_spreadsheet",
+    "import_invoices_xlsx",
+    "import_measurements_csv",
+    "import_measurements_spreadsheet",
+    "import_measurements_xlsx",
     "list_nfse_layouts",
     "parse_nfe",
     "parse_nfse",
