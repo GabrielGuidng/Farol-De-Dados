@@ -20,6 +20,15 @@ from backend.agentes.client import (
     LLMResponse,
     RecordedLLMCall,
 )
+from backend.agentes.jurista import (
+    MAX_RETRY_ATTEMPTS,
+    ExtractedRuleCandidate,
+    ExtractionMetadata,
+    JuristaExtractionPayload,
+    JuristaInput,
+    JuristaResult,
+    run_jurista_agent,
+)
 from backend.agentes.prompts import (
     DOCUMENT_END_DELIMITER,
     DOCUMENT_START_DELIMITER,
@@ -42,11 +51,17 @@ __all__ = [
     "LEGAL_AGENT_PROMPT_VERSION",
     "LEGAL_AGENT_SYSTEM_PROMPT",
     "LEGAL_AGENT_USER_TEMPLATE",
+    "MAX_RETRY_ATTEMPTS",
     "AnchoringCheckResult",
     "AnchoringIssueCode",
+    "ExtractedRuleCandidate",
+    "ExtractionMetadata",
     "FakeLLMClient",
     "GeminiLLMClient",
     "GeminiTransport",
+    "JuristaExtractionPayload",
+    "JuristaInput",
+    "JuristaResult",
     "LLMClient",
     "LLMConfig",
     "LLMExecutionError",
@@ -55,5 +70,6 @@ __all__ = [
     "excerpt_exists_in_document",
     "extract_numbers_from_text",
     "normalize_for_match",
+    "run_jurista_agent",
     "verify_rule_anchoring",
 ]
