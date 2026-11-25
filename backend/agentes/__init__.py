@@ -27,6 +27,11 @@ from backend.agentes.fiscal import (
     FiscalResult,
     run_fiscal_pdf_agent,
 )
+from backend.agentes.gemini_provider import (
+    DEFAULT_TIMEOUT_SECONDS,
+    build_gemini_json_schema,
+    create_gemini_transport,
+)
 from backend.agentes.jurista import (
     MAX_RETRY_ATTEMPTS,
     ExtractedRuleCandidate,
@@ -99,6 +104,7 @@ from backend.agentes.workflow import (
 __all__ = [
     "DEFAULT_CONFIDENCE_THRESHOLD",
     "DEFAULT_GEMINI_MODEL",
+    "DEFAULT_TIMEOUT_SECONDS",
     "DOCUMENT_END_DELIMITER",
     "DOCUMENT_START_DELIMITER",
     "FISCAL_AGENT_PROMPT_VERSION",
@@ -153,9 +159,11 @@ __all__ = [
     "allowed_numbers_from_audit",
     "build_contract_graph",
     "build_deterministic_report",
+    "build_gemini_json_schema",
     "build_invoice_graph",
     "build_invoice_report_node",
     "consolidate_contract_rules_node",
+    "create_gemini_transport",
     "dump_contract_state",
     "dump_invoice_state",
     "excerpt_exists_in_document",

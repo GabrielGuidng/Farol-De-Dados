@@ -11,6 +11,7 @@ from backend.schemas import StrictModel
 from backend.schemas.types import NonEmptyStr
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_TIMEOUT_SECONDS = 30
 
 GeminiTransport = Callable[[str, str, str, str, type[BaseModel]], str]
 
@@ -77,38 +78,6 @@ class LLMClient(Protocol):
         ...
 
 
-def _default_gemini_transport(
-    api_key: str,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    response_schema: type[BaseModel],
-) -> str:
-    """Executa uma chamada síncrona à API do Google Gemini com saída JSON estruturada."""
-    from google import genai
-    from google.genai import errors as genai_errors
-    from google.genai import types
-
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-                temperature=0.0,
-            ),
-        )
-    except (genai_errors.APIError, OSError, ValueError, RuntimeError) as exc:
-        raise LLMExecutionError(f"falha na chamada ao modelo {model}: {exc}") from exc
-
-    if not response.text:
-        raise LLMExecutionError(f"resposta vazia do modelo {model}")
-    return response.text
-
-
 class GeminiLLMClient:
     """Cliente Gemini com contingência automática entre até três chaves da API."""
 
@@ -116,19 +85,33 @@ class GeminiLLMClient:
         self,
         config: LLMConfig,
         *,
-        transport: GeminiTransport = _default_gemini_transport,
+        transport: GeminiTransport | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        if timeout_seconds < 1:
+            raise ValueError("timeout_seconds deve ser maior ou igual a 1")
+        if transport is None:
+            from backend.agentes.gemini_provider import create_gemini_transport
+
+            resolved = create_gemini_transport(timeout_seconds=timeout_seconds)
+        else:
+            resolved = transport
         self._config = config
-        self._transport = transport
+        self._transport = resolved
 
     @classmethod
     def from_env(
         cls,
         *,
-        transport: GeminiTransport = _default_gemini_transport,
+        transport: GeminiTransport | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> Self:
         """Instancia o cliente usando `LLMConfig.from_env()`."""
-        return cls(LLMConfig.from_env(), transport=transport)
+        return cls(
+            LLMConfig.from_env(),
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+        )
 
     @property
     def model_name(self) -> str:
