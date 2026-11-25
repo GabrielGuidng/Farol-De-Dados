@@ -91,7 +91,7 @@ Itens ainda não fixados. Registre cada decisão em [`.regras/decisoes.md`](.reg
 | Leitura de PDF | Adotada: `pdfplumber` (licença MIT). |
 | DOCX | Adotada: ancoragem por cláusula e parágrafo, sem conversão para PDF. |
 | OCR para PDFs escaneados | Etapa posterior. Até lá, documentos sem camada de texto são sinalizados e não processados. |
-| Provedor e modelo de linguagem | A definir. Configurável por variável de ambiente, atrás de uma interface (`LLMClient`); verificar retenção e treinamento antes de usar dados reais. |
+| Provedor e modelo de linguagem | Adotado no MVP: Google Gemini (AI Studio) atrás de `LLMClient`, com fallback de até 3 chaves de API; evolução prevista para API da Anthropic. |
 | Comunicação Streamlit e backend | A definir: via API FastAPI ou chamando o núcleo diretamente. |
 
 ---
@@ -168,8 +168,10 @@ cp .env.example .env     # preencha localmente; o .env nunca é versionado
 Exemplo de `.env.example`:
 
 ```text
+LLM_MODEL=gemini-2.5-flash
 LLM_API_KEY=
-LLM_MODEL=
+LLM_API_KEY_2=
+LLM_API_KEY_3=
 ```
 
 ### 3. Qualidade de código

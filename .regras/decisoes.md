@@ -16,7 +16,7 @@ Situações possíveis: **Adotada**, **Prevista**, **Em aberto**, **Etapa poster
 | Leitura de PDF | `pdfplumber` **(decisão adotada)** | Licença MIT (sem risco AGPL do PyMuPDF); extração de texto página a página. |
 | DOCX | Ancorar por cláusula e parágrafo **(decisão adotada)** | Dispensa conversão para PDF e LibreOffice; evidência marcada com `without_page=True`. |
 | OCR | Etapa posterior **(decisão)** | Até lá, documentos sem camada de texto são sinalizados e não processados. |
-| Provedor de modelo | **Em aberto** | Verificar retenção e uso para treinamento antes de qualquer dado real. Configurável por `LLM_MODEL`, atrás de `LLMClient`. |
+| Provedor de modelo | Google Gemini (AI Studio gratuito) no MVP; Anthropic prevista para evolução **(decisão adotada)** | No MVP e na apresentação, usa-se a API gratuita do Gemini com rotação de até 3 chaves (`LLM_API_KEY`, `LLM_API_KEY_2`, `LLM_API_KEY_3`) como contingência contra falhas/limites de cota, enviando apenas dados sintéticos/públicos com CPF/RG mascarados (o plano gratuito pode reter dados). Para dados reais/produção, migrar para API paga sem treinamento ou API da Anthropic atrás de `LLMClient`. |
 | Comunicação Streamlit e backend | **Em aberto** | Via API FastAPI ou chamando o núcleo diretamente. |
 | Índices de reajuste | Fora da primeira versão **(decisão)** | O sistema apenas sinaliza reajuste possivelmente devido. |
 | Mascaramento de CPF/RG | No protótipo **(decisão)** | Minimização de dados antes de envio a serviço externo. |
@@ -33,6 +33,6 @@ Situações possíveis: **Adotada**, **Prevista**, **Em aberto**, **Etapa poster
 |---|---|---|
 | `pdfplumber` e `python-docx` | 6 (leitura — **adicionadas**) | Leitura de PDF por página e DOCX por cláusula/parágrafo. |
 | `defusedxml` e `openpyxl` | 6 (leitura — **adicionadas**) | Leitura segura de XML de NF-e/NFS-e e planilhas `.xlsx`. |
-| SDK do provedor de modelo | 7 (agentes) | Depois da decisão do provedor. |
+| `google-genai` (SDK do provedor) | 7 (agentes — **adicionada**) | MVP com Google Gemini (AI Studio) atrás de `LLMClient`; permite migração futura para Anthropic. |
 | LibreOffice (sistema, não Python) | Descartado **(decisão)** | Não é necessário com ancoragem direta por cláusula e parágrafo em DOCX. |
 
