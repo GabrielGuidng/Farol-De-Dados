@@ -12,11 +12,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "openpyxl>=3.1.5",
-    # Previstas (adicionar quando o passo do roadmap chegar; ver .regras/decisoes.md):
-    # SDK do provedor de modelo.
     "pdfplumber>=0.11.11",
     "python-docx>=1.2.0",
     "defusedxml>=0.7.1",
+    "google-genai>=1.0",
 ]
 
 [dependency-groups]
