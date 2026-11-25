@@ -1,4 +1,4 @@
-"""Agentes de IA: cliente LLM, prompts versionados, ancoragem, Jurista e Fiscal (PDF)."""
+"""Agentes de IA: cliente LLM, prompts, ancoragem, Jurista, Fiscal, Tradutor, relatório e grafo."""
 
 from backend.agentes.anchoring import (
     DEFAULT_CONFIDENCE_THRESHOLD,
@@ -45,6 +45,19 @@ from backend.agentes.prompts import (
     LEGAL_AGENT_PROMPT_VERSION,
     LEGAL_AGENT_SYSTEM_PROMPT,
     LEGAL_AGENT_USER_TEMPLATE,
+    TRADUTOR_AGENT_PROMPT_VERSION,
+    TRADUTOR_AGENT_SYSTEM_PROMPT,
+    TRADUTOR_AGENT_USER_TEMPLATE,
+)
+from backend.agentes.tradutor import (
+    ItemRuleLink,
+    ItemRuleLinkCandidate,
+    LinkIssueCode,
+    TradutorExtractionPayload,
+    TradutorInput,
+    TradutorResult,
+    TranslationStatus,
+    run_tradutor_agent,
 )
 
 __all__ = [
@@ -59,6 +72,9 @@ __all__ = [
     "LEGAL_AGENT_SYSTEM_PROMPT",
     "LEGAL_AGENT_USER_TEMPLATE",
     "MAX_RETRY_ATTEMPTS",
+    "TRADUTOR_AGENT_PROMPT_VERSION",
+    "TRADUTOR_AGENT_SYSTEM_PROMPT",
+    "TRADUTOR_AGENT_USER_TEMPLATE",
     "AnchoringCheckResult",
     "AnchoringIssueCode",
     "ExtractedBillingItemCandidate",
@@ -70,6 +86,8 @@ __all__ = [
     "FiscalResult",
     "GeminiLLMClient",
     "GeminiTransport",
+    "ItemRuleLink",
+    "ItemRuleLinkCandidate",
     "JuristaExtractionPayload",
     "JuristaInput",
     "JuristaResult",
@@ -77,11 +95,17 @@ __all__ = [
     "LLMConfig",
     "LLMExecutionError",
     "LLMResponse",
+    "LinkIssueCode",
     "RecordedLLMCall",
+    "TradutorExtractionPayload",
+    "TradutorInput",
+    "TradutorResult",
+    "TranslationStatus",
     "excerpt_exists_in_document",
     "extract_numbers_from_text",
     "normalize_for_match",
     "run_fiscal_pdf_agent",
     "run_jurista_agent",
+    "run_tradutor_agent",
     "verify_rule_anchoring",
 ]
