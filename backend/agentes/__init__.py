@@ -20,6 +20,13 @@ from backend.agentes.client import (
     LLMResponse,
     RecordedLLMCall,
 )
+from backend.agentes.fiscal import (
+    ExtractedBillingItemCandidate,
+    FiscalExtractionPayload,
+    FiscalPdfInput,
+    FiscalResult,
+    run_fiscal_pdf_agent,
+)
 from backend.agentes.jurista import (
     MAX_RETRY_ATTEMPTS,
     ExtractedRuleCandidate,
@@ -54,9 +61,13 @@ __all__ = [
     "MAX_RETRY_ATTEMPTS",
     "AnchoringCheckResult",
     "AnchoringIssueCode",
+    "ExtractedBillingItemCandidate",
     "ExtractedRuleCandidate",
     "ExtractionMetadata",
     "FakeLLMClient",
+    "FiscalExtractionPayload",
+    "FiscalPdfInput",
+    "FiscalResult",
     "GeminiLLMClient",
     "GeminiTransport",
     "JuristaExtractionPayload",
@@ -70,6 +81,7 @@ __all__ = [
     "excerpt_exists_in_document",
     "extract_numbers_from_text",
     "normalize_for_match",
+    "run_fiscal_pdf_agent",
     "run_jurista_agent",
     "verify_rule_anchoring",
 ]
