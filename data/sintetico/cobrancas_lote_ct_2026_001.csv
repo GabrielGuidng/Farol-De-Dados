@@ -1,0 +1,8 @@
+numero;fornecedor;cnpj;contrato;emissao;competencia;total_nota;horas_medidas;descricao;quantidade;unidade;valor_unitario;valor_total
+103;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2026-07-31;2026-07;12.000,00;46;Mensalidade de suporte;1;mês;10.800,00;10.800,00
+103;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2026-07-31;2026-07;12.000,00;46;Horas excedentes de suporte;8;hora;150,00;1.200,00
+105;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2026-08-30;2026-08;10.800,00;40;Mensalidade de suporte;1;mês;10.800,00;10.800,00
+106;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2026-08-31;2026-08;10.800,00;40;Mensalidade de suporte;1;mês;10.800,00;10.800,00
+107;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2027-01-31;2027-01;10.500,00;;Mensalidade de suporte;1;mês;10.500,00;10.500,00
+108;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2026-11-30;2026-11;10.950,00;;Mensalidade de suporte;1;mês;10.500,00;10.500,00
+108;Fornecedor Exemplo Ltda.;11.222.333/0001-81;CT-2026-001;2026-11-30;2026-11;10.950,00;;Horas excedentes de suporte;3;hora;150,00;450,00

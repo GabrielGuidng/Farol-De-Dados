@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CompNfse>
+  <Nfse>
+    <InfNfse Id="nfse-109">
+      <Numero>109</Numero>
+      <DataEmissao>2026-06-15</DataEmissao>
+      <Servico>
+        <Valores>
+          <ValorServicos>10800.00</ValorServicos>
+        </Valores>
+        <Discriminacao>Mensalidade de suporte referente ao Contrato CT-2026-001</Discriminacao>
+      </Servico>
+      <PrestadorServico>
+        <IdentificacaoPrestador>
+          <CpfCnpj>
+            <Cnpj>11222333000181</Cnpj>
+          </CpfCnpj>
+        </IdentificacaoPrestador>
+        <RazaoSocial>Fornecedor Exemplo Ltda.</RazaoSocial>
+      </PrestadorServico>
+    </InfNfse>
+  </Nfse>
+</CompNfse>

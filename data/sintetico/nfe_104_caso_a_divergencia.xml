@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">
+  <NFe>
+    <infNFe Id="NFe-104" versao="4.00">
+      <ide>
+        <nNF>104</nNF>
+        <dhEmi>2026-10-30T10:00:00-03:00</dhEmi>
+      </ide>
+      <emit>
+        <CNPJ>11222333000181</CNPJ>
+        <xNome>Fornecedor Exemplo Ltda.</xNome>
+      </emit>
+      <det nItem="1">
+        <prod>
+          <xProd>Sustentação técnica continuada mensal</xProd>
+          <qCom>1</qCom>
+          <uCom>mês</uCom>
+          <vUnCom>10800.00</vUnCom>
+          <vProd>10800.00</vProd>
+        </prod>
+      </det>
+      <total>
+        <ICMSTot>
+          <vNF>10800.00</vNF>
+        </ICMSTot>
+      </total>
+      <infAdic>
+        <infCpl>Contrato CT-2026-001 competencia 10/2026</infCpl>
+      </infAdic>
+    </infNFe>
+  </NFe>
+</nfeProc>

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">
+  <NFe>
+    <infNFe Id="NFe-101" versao="4.00">
+      <ide>
+        <nNF>101</nNF>
+        <dhEmi>2026-04-28T10:00:00-03:00</dhEmi>
+      </ide>
+      <emit>
+        <CNPJ>11222333000181</CNPJ>
+        <xNome>Fornecedor Exemplo Ltda.</xNome>
+      </emit>
+      <det nItem="1">
+        <prod>
+          <xProd>Mensalidade de suporte</xProd>
+          <qCom>1</qCom>
+          <uCom>mês</uCom>
+          <vUnCom>10000.00</vUnCom>
+          <vProd>10000.00</vProd>
+        </prod>
+      </det>
+      <total>
+        <ICMSTot>
+          <vNF>10000.00</vNF>
+        </ICMSTot>
+      </total>
+      <infAdic>
+        <infCpl>Referente ao Contrato CT-2026-001 competencia 2026-04</infCpl>
+      </infAdic>
+    </infNFe>
+  </NFe>
+</nfeProc>

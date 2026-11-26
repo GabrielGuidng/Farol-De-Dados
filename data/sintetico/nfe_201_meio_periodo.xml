@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">
+  <NFe>
+    <infNFe Id="NFe-201" versao="4.00">
+      <ide>
+        <nNF>201</nNF>
+        <dhEmi>2026-04-30T10:00:00-03:00</dhEmi>
+      </ide>
+      <emit>
+        <CNPJ>33000167000101</CNPJ>
+        <xNome>InfraCloud Brasil S.A.</xNome>
+      </emit>
+      <det nItem="1">
+        <prod>
+          <xProd>Servicos de nuvem gerenciada</xProd>
+          <qCom>1</qCom>
+          <uCom>mês</uCom>
+          <vUnCom>5500.00</vUnCom>
+          <vProd>5500.00</vProd>
+        </prod>
+      </det>
+      <total>
+        <ICMSTot>
+          <vNF>5500.00</vNF>
+        </ICMSTot>
+      </total>
+      <infAdic>
+        <infCpl>Contrato CT-2026-002 competencia 2026-04</infCpl>
+      </infAdic>
+    </infNFe>
+  </NFe>
+</nfeProc>
