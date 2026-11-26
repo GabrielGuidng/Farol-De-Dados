@@ -3,6 +3,7 @@
 import os
 from collections import deque
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -10,8 +11,13 @@ from pydantic import BaseModel, Field
 from backend.schemas import StrictModel
 from backend.schemas.types import NonEmptyStr
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_FALLBACK_MODELS: tuple[str, ...] = (
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+)
+DEFAULT_TIMEOUT_SECONDS = 45
 
 GeminiTransport = Callable[[str, str, str, str, type[BaseModel]], str]
 
@@ -36,26 +42,81 @@ class RecordedLLMCall(StrictModel):
     schema_name: NonEmptyStr
 
 
+def parse_dotenv_file(env_path: Path) -> dict[str, str]:
+    """Lê pares chave=valor de um arquivo `.env` simples sem alterar `os.environ`."""
+    if not env_path.is_file():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        clean_key = key.strip()
+        if not clean_key:
+            continue
+        clean_value = raw_value.strip()
+        if (
+            len(clean_value) >= 2
+            and clean_value[0] == clean_value[-1]
+            and clean_value[0] in ("'", '"')
+        ):
+            clean_value = clean_value[1:-1]
+        values[clean_key] = clean_value
+    return values
+
+
 class LLMConfig(StrictModel):
     """Configuração de modelo e chaves de contingência lidas de variáveis de ambiente."""
 
     model: NonEmptyStr = DEFAULT_GEMINI_MODEL
     api_keys: tuple[NonEmptyStr, ...]
+    fallback_models: tuple[NonEmptyStr, ...] = ()
 
     @classmethod
-    def from_env(cls) -> Self:
+    def from_env(
+        cls,
+        *,
+        env_file: Path | None = None,
+        load_dotenv: bool = True,
+    ) -> Self:
         """Lê `LLM_MODEL` e até três chaves (`LLM_API_KEY`, `LLM_API_KEY_2`, `LLM_API_KEY_3`)."""
-        model = os.environ.get("LLM_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+        dotenv_values = (
+            parse_dotenv_file(env_file if env_file is not None else Path(".env"))
+            if load_dotenv
+            else {}
+        )
+
+        def _get_var(name: str) -> str:
+            if name in os.environ:
+                return os.environ[name].strip()
+            return dotenv_values.get(name, "").strip()
+
+        model = _get_var("LLM_MODEL") or DEFAULT_GEMINI_MODEL
         keys = tuple(
-            value.strip()
+            value
             for env_name in ("LLM_API_KEY", "LLM_API_KEY_2", "LLM_API_KEY_3")
-            if (value := os.environ.get(env_name, "").strip())
+            if (value := _get_var(env_name))
         )
         if not keys:
             raise ValueError(
                 "nenhuma chave configurada em LLM_API_KEY, LLM_API_KEY_2 ou LLM_API_KEY_3"
             )
-        return cls(model=model, api_keys=keys)
+        raw_fallbacks = _get_var("LLM_FALLBACK_MODELS")
+        if raw_fallbacks:
+            fallbacks = tuple(
+                part.strip()
+                for part in raw_fallbacks.split(",")
+                if part.strip() and part.strip() != model
+            )
+        else:
+            fallbacks = tuple(item for item in DEFAULT_FALLBACK_MODELS if item != model)
+        return cls(model=model, api_keys=keys, fallback_models=fallbacks)
 
 
 @runtime_checkable
@@ -98,6 +159,7 @@ class GeminiLLMClient:
             resolved = transport
         self._config = config
         self._transport = resolved
+        self._preferred_model: str = config.model
 
     @classmethod
     def from_env(
@@ -105,10 +167,12 @@ class GeminiLLMClient:
         *,
         transport: GeminiTransport | None = None,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env_file: Path | None = None,
+        load_dotenv: bool = True,
     ) -> Self:
         """Instancia o cliente usando `LLMConfig.from_env()`."""
         return cls(
-            LLMConfig.from_env(),
+            LLMConfig.from_env(env_file=env_file, load_dotenv=load_dotenv),
             transport=transport,
             timeout_seconds=timeout_seconds,
         )
@@ -125,24 +189,33 @@ class GeminiLLMClient:
         user_prompt: str,
         response_schema: type[BaseModel],
     ) -> LLMResponse:
-        """Tenta as chaves configuradas em ordem; passa para a próxima se ocorrer falha."""
+        """Tenta chaves e modelos de contingência em ordem; prioriza o último saudável."""
+        all_models = (self._config.model, *self._config.fallback_models)
+        ordered_models = (
+            self._preferred_model,
+            *(m for m in all_models if m != self._preferred_model),
+        )
         last_error: LLMExecutionError | None = None
-        for index, api_key in enumerate(self._config.api_keys, start=1):
-            try:
-                content = self._transport(
-                    api_key,
-                    self._config.model,
-                    system_prompt,
-                    user_prompt,
-                    response_schema,
-                )
-                return LLMResponse(content=content, model=self._config.model, key_index=index)
-            except LLMExecutionError as exc:
-                last_error = exc
+        for candidate_model in ordered_models:
+            for index, api_key in enumerate(self._config.api_keys, start=1):
+                try:
+                    content = self._transport(
+                        api_key,
+                        candidate_model,
+                        system_prompt,
+                        user_prompt,
+                        response_schema,
+                    )
+                    self._preferred_model = candidate_model
+                    return LLMResponse(content=content, model=candidate_model, key_index=index)
+                except LLMExecutionError as exc:
+                    last_error = exc
 
+        api_key = "<redacted>"
         total = len(self._config.api_keys)
+        models_tried = ", ".join(ordered_models)
         raise LLMExecutionError(
-            f"todas as {total} chave(s) falharam para {self._config.model}: {last_error}"
+            f"todas as {total} chave(s) falharam nos modelos [{models_tried}]: {last_error}"
         ) from last_error
 
 

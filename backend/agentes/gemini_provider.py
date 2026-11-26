@@ -5,11 +5,22 @@ from collections.abc import Mapping
 import httpx
 from pydantic import BaseModel
 
+try:
+    import httpx2
+
+    _HTTP_ERROR_TYPES: tuple[type[Exception], ...] = (httpx.HTTPError, httpx2.HTTPError)
+except ImportError:
+    _HTTP_ERROR_TYPES = (httpx.HTTPError,)
+
 from backend.agentes.client import GeminiTransport, LLMExecutionError
 
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = 45
 
 _STRIPPED_SCHEMA_KEYS = frozenset({"decimal_places", "max_digits"})
+_NUMERIC_BOUND_KEYS = frozenset(
+    {"ge", "gt", "le", "lt", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}
+)
+_DECIMAL_STRING_PATTERN = r"^[0-9]+(\.[0-9]+)?$"
 
 
 def _is_decimal_union(branches: list[object]) -> bool:
@@ -42,11 +53,18 @@ def _sanitize_schema_node(node: object) -> object:
 
     any_of = sanitized.get("anyOf")
     if isinstance(any_of, list) and _is_decimal_union(any_of):
-        kept = [
-            branch
-            for branch in any_of
-            if isinstance(branch, dict) and branch.get("type") != "number"
-        ]
+        for bound_key in _NUMERIC_BOUND_KEYS:
+            sanitized.pop(bound_key, None)
+        kept: list[object] = []
+        for branch in any_of:
+            if not isinstance(branch, dict) or branch.get("type") == "number":
+                continue
+            if branch.get("type") == "string":
+                clean_branch = {k: v for k, v in branch.items() if k not in _NUMERIC_BOUND_KEYS}
+                clean_branch["pattern"] = _DECIMAL_STRING_PATTERN
+                kept.append(clean_branch)
+            else:
+                kept.append(branch)
         if len(kept) == 1 and isinstance(kept[0], dict):
             sanitized.pop("anyOf")
             sanitized.update(kept[0])
@@ -71,7 +89,7 @@ def create_gemini_transport(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -
     """Cria função de transporte síncrona para a API do Gemini com timeout e JSON Schema."""
     if timeout_seconds < 1:
         raise ValueError("timeout_seconds deve ser maior ou igual a 1")
-    timeout_ms = timeout_seconds * 1000
+    timeout_ms = max(timeout_seconds, 10) * 1000
 
     def _transport(
         api_key: str,
@@ -88,7 +106,10 @@ def create_gemini_transport(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -
         try:
             client = genai.Client(
                 api_key=api_key,
-                http_options=types.HttpOptions(timeout=timeout_ms),
+                http_options=types.HttpOptions(
+                    timeout=timeout_ms,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
             )
             response = client.models.generate_content(
                 model=model,
@@ -102,12 +123,13 @@ def create_gemini_transport(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -
             )
         except (
             genai_errors.APIError,
-            httpx.HTTPError,
+            *_HTTP_ERROR_TYPES,
             TimeoutError,
             OSError,
             ValueError,
             RuntimeError,
         ) as exc:
+            api_key = "<redacted>"
             raise LLMExecutionError(f"falha na chamada ao modelo {model}: {exc}") from exc
 
         if not response.text:

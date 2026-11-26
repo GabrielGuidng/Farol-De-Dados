@@ -10,6 +10,7 @@ from backend.agentes.anchoring import (
     verify_rule_anchoring,
 )
 from backend.agentes.client import (
+    DEFAULT_FALLBACK_MODELS,
     DEFAULT_GEMINI_MODEL,
     FakeLLMClient,
     GeminiLLMClient,
@@ -19,6 +20,7 @@ from backend.agentes.client import (
     LLMExecutionError,
     LLMResponse,
     RecordedLLMCall,
+    parse_dotenv_file,
 )
 from backend.agentes.fiscal import (
     ExtractedBillingItemCandidate,
@@ -103,6 +105,7 @@ from backend.agentes.workflow import (
 
 __all__ = [
     "DEFAULT_CONFIDENCE_THRESHOLD",
+    "DEFAULT_FALLBACK_MODELS",
     "DEFAULT_GEMINI_MODEL",
     "DEFAULT_TIMEOUT_SECONDS",
     "DOCUMENT_END_DELIMITER",
@@ -176,6 +179,7 @@ __all__ = [
     "load_contract_state",
     "load_invoice_state",
     "normalize_for_match",
+    "parse_dotenv_file",
     "review_ambiguous_links_node",
     "run_fiscal_pdf_agent",
     "run_invoice_motor_node",
