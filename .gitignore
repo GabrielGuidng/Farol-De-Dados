@@ -42,10 +42,11 @@ data/privado/
 # Saídas de avaliação brutas podem conter trechos de documentos; revise antes de versionar
 evaluation/results/**/*.raw.*
 
-# Editores / SO
+# Editores / SO / skills locais
 .idea/
 .vscode/
 .DS_Store
+.agents/
 
 # Documentos de referência locais (não versionados)
 docs/
