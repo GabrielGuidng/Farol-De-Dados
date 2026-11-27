@@ -17,7 +17,7 @@ Situações possíveis: **Adotada**, **Prevista**, **Em aberto**, **Etapa poster
 | DOCX | Ancorar por cláusula e parágrafo **(decisão adotada)** | Dispensa conversão para PDF e LibreOffice; evidência marcada com `without_page=True`. |
 | OCR | Etapa posterior **(decisão)** | Até lá, documentos sem camada de texto são sinalizados e não processados. |
 | Provedor de modelo | Google Gemini (AI Studio gratuito) no MVP; Anthropic prevista para evolução **(decisão adotada)** | No MVP e na apresentação, usa-se a API gratuita do Gemini com rotação de até 3 chaves (`LLM_API_KEY`, `LLM_API_KEY_2`, `LLM_API_KEY_3`) como contingência contra falhas/limites de cota, enviando apenas dados sintéticos/públicos com CPF/RG mascarados (o plano gratuito pode reter dados). Para dados reais/produção, migrar para API paga sem treinamento ou API da Anthropic atrás de `LLMClient`. |
-| Comunicação Streamlit e backend | **Em aberto** | Via API FastAPI ou chamando o núcleo diretamente. |
+| Comunicação Streamlit e backend | **Chamada direta a `backend/api/services.py` no protótipo** | Interface Streamlit importa casos de uso diretamente no MVP para manter fluxo simples e rastreável; API FastAPI em `main.py` permanece opcional para exposição externa futura. |
 | Índices de reajuste | Fora da primeira versão **(decisão)** | O sistema apenas sinaliza reajuste possivelmente devido. |
 | Mascaramento de CPF/RG | No protótipo **(decisão)** | Minimização de dados antes de envio a serviço externo. |
 | Isolamento entre empresas e perfis de acesso | Fora da primeira versão **(decisão)** | O protótipo opera com usuário e empresa simulados. |
