@@ -1259,7 +1259,7 @@ def _classify_uploaded_file_with_content(
         return "BILLING", None, None
 
     try:
-        parsed: _ParsedContractUpload | None = _read_contract_bytes(file_name, raw_bytes)
+        parsed: _ParsedContractUpload = _read_contract_bytes(file_name, raw_bytes)
     except (OSError, ValueError):
         parsed = _ParsedContractUpload(
             read_quality=ReadQuality.NO_TEXT,
@@ -1267,7 +1267,7 @@ def _classify_uploaded_file_with_content(
             read_warning=f"Falha ao ler texto de '{file_name}'.",
         )
 
-    if mode in {"CONTRACT", "AMENDMENT", "BILLING", "DOSSIER"}:
+    if mode != "AUTO":
         return mode, parsed, None
 
     lowered = file_name.casefold()
@@ -1784,7 +1784,13 @@ def ingest_uploaded_files(
         [(name, payload, kind, pre_parsed) for _, name, payload, kind, pre_parsed, _ in classified]
     )
 
-    order_rank = {"CONTRACT": 0, "DOSSIER": 1, "AMENDMENT": 2, "BILLING": 3, "SKIPPED": 4}
+    order_rank: dict[_DetectedUploadKind, int] = {
+        "CONTRACT": 0,
+        "DOSSIER": 1,
+        "AMENDMENT": 2,
+        "BILLING": 3,
+        "SKIPPED": 4,
+    }
     ordered = sorted(classified, key=lambda item: order_rank[item[3]])
     outcomes: list[UploadedFileOutcome] = []
     affected_contract_ids: set[str] = set()
