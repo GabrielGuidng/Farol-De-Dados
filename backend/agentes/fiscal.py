@@ -1,6 +1,7 @@
 """Agente Fiscal para faturas em PDF (XML e planilhas usam os parsers do Épico 4)."""
 
 from datetime import UTC, datetime
+from typing import Self
 
 from pydantic import Field, ValidationError
 
@@ -12,10 +13,9 @@ from backend.agentes.prompts import (
     FISCAL_AGENT_SYSTEM_PROMPT,
     FISCAL_AGENT_USER_TEMPLATE,
 )
-from backend.leitura import PdfPage, PdfReadResult, mask_text
+from backend.leitura import DocxReadResult, PdfPage, PdfReadResult, mask_text
 from backend.schemas import (
     BillingItem,
-    Cnpj,
     DocumentType,
     Invoice,
     InvoiceSource,
@@ -25,12 +25,15 @@ from backend.schemas import (
     ReferencePeriod,
     StrictModel,
     UnitPrice,
+    is_valid_cnpj,
+    normalize_cnpj,
 )
 from backend.schemas.types import EntityId, NonEmptyStr, PlainDate
 
 _NO_TEXT_WARNING = (
     "PDF de cobrança sem camada de texto legível; o Agente Fiscal não processou o arquivo."
 )
+_PROVISIONAL_FISCAL_CNPJ = "00000000000191"
 
 
 class ExtractedBillingItemCandidate(StrictModel):
@@ -44,12 +47,28 @@ class ExtractedBillingItemCandidate(StrictModel):
     literal_excerpt: NonEmptyStr
 
 
-class FiscalExtractionPayload(StrictModel):
-    """Saída estruturada devolvida pelo modelo na leitura de fatura em PDF."""
+class ExtractedInvoiceEntry(StrictModel):
+    """Entrada estruturada de fatura/nota fiscal extraída pelo Agente Fiscal."""
 
     contract_id: EntityId | None = None
     supplier: NonEmptyStr
-    supplier_cnpj: Cnpj
+    supplier_cnpj: str | None = None
+    number: NonEmptyStr
+    issue_date: PlainDate
+    reference_period: ReferencePeriod | None = None
+    total: Money
+    measured_hours: Quantity | None = None
+    page: int = Field(default=1, ge=1)
+    literal_excerpt: NonEmptyStr
+    items: tuple[ExtractedBillingItemCandidate, ...] = ()
+
+
+class FiscalExtractionPayload(StrictModel):
+    """Saída estruturada devolvida pelo modelo na leitura de fatura(s) em PDF/DOCX."""
+
+    contract_id: EntityId | None = None
+    supplier: NonEmptyStr
+    supplier_cnpj: str | None = None
     number: NonEmptyStr
     issue_date: PlainDate
     reference_period: ReferencePeriod | None = None
@@ -58,6 +77,7 @@ class FiscalExtractionPayload(StrictModel):
     page: int = Field(ge=1)
     literal_excerpt: NonEmptyStr
     items: tuple[ExtractedBillingItemCandidate, ...] = ()
+    additional_invoices: tuple[ExtractedInvoiceEntry, ...] = ()
 
 
 class FiscalPdfInput(StrictModel):
@@ -76,7 +96,7 @@ class FiscalPdfInput(StrictModel):
         pdf_result: PdfReadResult,
         *,
         file_hash: str | None = None,
-    ) -> "FiscalPdfInput":
+    ) -> Self:
         """Constrói entrada do Fiscal a partir do resultado de `read_pdf`."""
         return cls(
             document_id=document_id,
@@ -86,11 +106,33 @@ class FiscalPdfInput(StrictModel):
             pages=pdf_result.pages,
         )
 
+    @classmethod
+    def from_docx(
+        cls,
+        document_id: str,
+        docx_result: DocxReadResult,
+        *,
+        file_hash: str | None = None,
+    ) -> Self:
+        """Constrói entrada do Fiscal a partir do resultado de `read_docx`."""
+        has_text = docx_result.read_quality is ReadQuality.OK and bool(
+            docx_result.full_text.strip()
+        )
+        pages = (PdfPage(page_number=1, text=docx_result.full_text),) if has_text else ()
+        return cls(
+            document_id=document_id,
+            document_type=DocumentType.INVOICE,
+            file_hash=file_hash,
+            read_quality=docx_result.read_quality if has_text else ReadQuality.NO_TEXT,
+            pages=pages,
+        )
+
 
 class FiscalResult(StrictModel):
-    """Resultado do Agente Fiscal para PDF: `Invoice` validada, ancoragem e avisos."""
+    """Resultado do Agente Fiscal para PDF/DOCX: `Invoice`(s) validadas, ancoragem e avisos."""
 
     invoice: Invoice | None = None
+    invoices: tuple[Invoice, ...] = ()
     anchoring_valid: bool = True
     schema_valid: bool = True
     warnings: tuple[str, ...] = ()
@@ -171,32 +213,100 @@ def run_fiscal_pdf_agent(
             metadata=metadata,
         )
 
+    raw_entries: list[ExtractedInvoiceEntry] = [
+        ExtractedInvoiceEntry(
+            contract_id=parsed.contract_id,
+            supplier=parsed.supplier,
+            supplier_cnpj=parsed.supplier_cnpj,
+            number=parsed.number,
+            issue_date=parsed.issue_date,
+            reference_period=parsed.reference_period,
+            total=parsed.total,
+            measured_hours=parsed.measured_hours,
+            page=parsed.page,
+            literal_excerpt=parsed.literal_excerpt,
+            items=parsed.items,
+        ),
+        *parsed.additional_invoices,
+    ]
+
     warnings: list[str] = []
-    competence_inferred = parsed.reference_period is None
-    reference_period = (
-        parsed.reference_period
-        if parsed.reference_period is not None
-        else ReferencePeriod(year=parsed.issue_date.year, month=parsed.issue_date.month)
-    )
-    if competence_inferred:
-        warnings.append(
-            f"Competência {reference_period} inferida pela data de emissão "
-            f"({parsed.issue_date.isoformat()}); requer revisão humana."
+    anchoring_valid = True
+    built_invoices: list[Invoice] = []
+
+    for idx, entry in enumerate(raw_entries, start=1):
+        competence_inferred = entry.reference_period is None
+        reference_period = (
+            entry.reference_period
+            if entry.reference_period is not None
+            else ReferencePeriod(year=entry.issue_date.year, month=entry.issue_date.month)
         )
+        if competence_inferred:
+            warnings.append(
+                f"Competência {reference_period} inferida pela data de emissão "
+                f"({entry.issue_date.isoformat()}) na cobrança {entry.number}; requer revisão "
+                "humana."
+            )
 
-    anchoring_valid = excerpt_exists_in_document(
-        parsed.literal_excerpt,
-        document_text,
-        page=parsed.page,
-        pages_by_number=masked_pages,
-    ) and parsed.total in extract_numbers_from_text(parsed.literal_excerpt)
+        raw_cnpj = (entry.supplier_cnpj or "").strip()
+        if raw_cnpj and is_valid_cnpj(raw_cnpj):
+            resolved_cnpj = normalize_cnpj(raw_cnpj)
+        else:
+            resolved_cnpj = _PROVISIONAL_FISCAL_CNPJ
+            if raw_cnpj:
+                warnings.append(
+                    f"CNPJ do emitente na cobrança {entry.number} ('{raw_cnpj}') está incompleto "
+                    "ou inválido; utilizado CNPJ provisório para permitir revisão e auditoria."
+                )
+            else:
+                warnings.append(
+                    f"CNPJ do emitente ausente na cobrança {entry.number}; utilizado CNPJ "
+                    "provisório para permitir revisão e auditoria."
+                )
 
-    for item in parsed.items:
-        item_ok = excerpt_exists_in_document(
-            item.literal_excerpt, document_text
-        ) and item.total_value in extract_numbers_from_text(item.literal_excerpt)
-        if not item_ok:
+        entry_anchoring = excerpt_exists_in_document(
+            entry.literal_excerpt,
+            document_text,
+            page=entry.page,
+            pages_by_number=masked_pages,
+        ) and entry.total in extract_numbers_from_text(entry.literal_excerpt)
+
+        for item in entry.items:
+            item_ok = excerpt_exists_in_document(
+                item.literal_excerpt, document_text
+            ) and item.total_value in extract_numbers_from_text(item.literal_excerpt)
+            if not item_ok:
+                entry_anchoring = False
+        if not entry_anchoring:
             anchoring_valid = False
+
+        items = tuple(
+            BillingItem(
+                description=item.description,
+                quantity=item.quantity,
+                unit=item.unit,
+                unit_value=item.unit_value,
+                total_value=item.total_value,
+            )
+            for item in entry.items
+        )
+        inv_id = f"pdf-{payload.document_id}" if idx == 1 else f"pdf-{payload.document_id}-{idx}"
+        built_invoices.append(
+            Invoice(
+                id=inv_id,
+                contract_id=entry.contract_id,
+                supplier=entry.supplier,
+                supplier_cnpj=resolved_cnpj,
+                number=entry.number,
+                issue_date=entry.issue_date,
+                reference_period=reference_period,
+                competence_inferred=competence_inferred,
+                total=entry.total,
+                measured_hours=entry.measured_hours,
+                source=InvoiceSource.PDF,
+                items=items,
+            )
+        )
 
     if not anchoring_valid:
         warnings.append(
@@ -204,32 +314,9 @@ def run_fiscal_pdf_agent(
             "manualmente antes da auditoria."
         )
 
-    items = tuple(
-        BillingItem(
-            description=item.description,
-            quantity=item.quantity,
-            unit=item.unit,
-            unit_value=item.unit_value,
-            total_value=item.total_value,
-        )
-        for item in parsed.items
-    )
-    invoice = Invoice(
-        id=f"pdf-{payload.document_id}",
-        contract_id=parsed.contract_id,
-        supplier=parsed.supplier,
-        supplier_cnpj=parsed.supplier_cnpj,
-        number=parsed.number,
-        issue_date=parsed.issue_date,
-        reference_period=reference_period,
-        competence_inferred=competence_inferred,
-        total=parsed.total,
-        measured_hours=parsed.measured_hours,
-        source=InvoiceSource.PDF,
-        items=items,
-    )
     return FiscalResult(
-        invoice=invoice,
+        invoice=built_invoices[0] if built_invoices else None,
+        invoices=tuple(built_invoices),
         anchoring_valid=anchoring_valid,
         schema_valid=True,
         warnings=tuple(warnings),

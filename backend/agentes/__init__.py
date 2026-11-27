@@ -24,6 +24,7 @@ from backend.agentes.client import (
 )
 from backend.agentes.fiscal import (
     ExtractedBillingItemCandidate,
+    ExtractedInvoiceEntry,
     FiscalExtractionPayload,
     FiscalPdfInput,
     FiscalResult,
@@ -131,6 +132,7 @@ __all__ = [
     "ContractGraphEnvelope",
     "ContractWorkflowState",
     "ExtractedBillingItemCandidate",
+    "ExtractedInvoiceEntry",
     "ExtractedRuleCandidate",
     "ExtractionMetadata",
     "FakeLLMClient",
