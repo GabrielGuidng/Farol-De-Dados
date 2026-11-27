@@ -8,6 +8,7 @@ import pytest
 
 from backend.agentes import (
     ExtractedBillingItemCandidate,
+    ExtractedInvoiceEntry,
     ExtractedRuleCandidate,
     FakeLLMClient,
     FiscalExtractionPayload,
@@ -17,7 +18,12 @@ from backend.agentes import (
     TradutorExtractionPayload,
 )
 from backend.api import (
+    assign_invoice_contract,
     audit_stored_invoice,
+    delete_all_uploaded_documents,
+    delete_empty_contract,
+    delete_uploaded_document,
+    fetch_amendments,
     fetch_audits,
     fetch_contract,
     fetch_contracts,
@@ -25,18 +31,24 @@ from backend.api import (
     fetch_invoices,
     fetch_reviews,
     fetch_rules,
+    get_contract_timeline,
+    get_rules_for_competence,
     import_billing_document,
+    ingest_uploaded_files,
     mark_amendment_reviewed,
     process_contract_document,
     record_audit_decision,
     register_amendment,
     register_contract,
     register_human_decision,
+    reset_all_data,
     resolve_contract_link,
     review_document,
     review_rule,
+    seed_synthetic_demo,
 )
 from backend.leitura import CPF_MASK, RG_MASK
+from backend.motor import SelectionStatus
 from backend.persistencia import connect, init_db
 from backend.schemas import (
     Amendment,
@@ -44,6 +56,7 @@ from backend.schemas import (
     Contract,
     DocumentType,
     ReadQuality,
+    ReferencePeriod,
     ReviewDecision,
     ReviewStatus,
     ReviewTargetType,
@@ -51,7 +64,7 @@ from backend.schemas import (
     RuleType,
     ValidityPeriod,
 )
-from tests.fixtures.synthetic_files import SYNTHETIC_DIR
+from tests.fixtures.synthetic_files import SYNTHETIC_DIR, build_synthetic_docx, build_synthetic_pdf
 
 _TS = datetime(2026, 11, 27, 10, 0, tzinfo=UTC)
 
@@ -1004,3 +1017,754 @@ def test_register_human_decision_for_audit_rule_and_document(tmp_path: Path) -> 
                 justification="Não existe.",
                 reviewed_at=_TS,
             )
+
+
+def test_timeline_competence_lookup_assign_seed_and_reset(tmp_path: Path) -> None:
+    db_path = tmp_path / "demo_services.db"
+    init_db(db_path).close()
+
+    with connect(db_path) as conn:
+        seeded_ids = seed_synthetic_demo(conn, SYNTHETIC_DIR, reviewed_at=_TS)
+        assert seeded_ids[0] == "CT-2026-001"
+        assert len(fetch_amendments(conn, "CT-2026-001")) == 2
+
+        timeline = get_contract_timeline(conn, "CT-2026-001")
+        assert timeline.complete is True
+        monthly_versions = sorted(
+            (rule for rule in timeline.rules if rule.rule_type is RuleType.MONTHLY_PRICE),
+            key=lambda rule: rule.version,
+        )
+        assert [rule.value for rule in monthly_versions] == [
+            Decimal("10000.00"),
+            Decimal("10800.00"),
+            Decimal("10500.00"),
+        ]
+
+        abr = get_rules_for_competence(
+            conn, "CT-2026-001", ReferencePeriod.model_validate("2026-04")
+        )
+        assert abr.selections[RuleType.MONTHLY_PRICE].status is SelectionStatus.SELECTED
+        assert abr.selections[RuleType.MONTHLY_PRICE].rule is not None
+        assert abr.selections[RuleType.MONTHLY_PRICE].rule.value == Decimal("10000.00")
+
+        mai = get_rules_for_competence(
+            conn, "CT-2026-001", ReferencePeriod.model_validate("2026-05")
+        )
+        assert mai.selections[RuleType.MONTHLY_PRICE].rule is not None
+        assert mai.selections[RuleType.MONTHLY_PRICE].rule.value == Decimal("10800.00")
+
+        out = get_rules_for_competence(
+            conn, "CT-2026-001", ReferencePeriod.model_validate("2026-10")
+        )
+        assert out.selections[RuleType.MONTHLY_PRICE].rule is not None
+        assert out.selections[RuleType.MONTHLY_PRICE].rule.value == Decimal("10500.00")
+        assert out.selections[RuleType.EXTENSION].status is SelectionStatus.NO_RULE
+
+        orphan = import_billing_document(
+            conn,
+            document_id="doc-orphan",
+            file_name="nfe_202_sem_contrato.xml",
+            content=SYNTHETIC_DIR / "nfe_202_sem_contrato.xml",
+            received_at=_TS,
+            invoice_id="inv-orphan",
+        )
+        assert orphan.unlinked_invoice_ids == ("inv-orphan",)
+        linked = assign_invoice_contract(conn, "inv-orphan", "CT-2026-001")
+        assert linked.contract_id == "CT-2026-001"
+
+        with pytest.raises(ValueError, match="já está cadastrado"):
+            seed_synthetic_demo(conn, SYNTHETIC_DIR, reviewed_at=_TS)
+
+    reset_all_data(db_path)
+    with connect(db_path) as conn:
+        assert fetch_contracts(conn) == ()
+        assert fetch_rules(conn) == ()
+        assert fetch_reviews(conn) == ()
+        assert fetch_invoices(conn) == ()
+
+
+def test_ingest_uploaded_files_auto_registers_contract_and_handles_all_extensions(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "batch_upload.db"
+    init_db(db_path).close()
+
+    files = [
+        (
+            "ct_2026_001_contrato_base.pdf",
+            (SYNTHETIC_DIR / "ct_2026_001_contrato_base.pdf").read_bytes(),
+        ),
+        (
+            "ct_2026_001_aditivo_01.docx",
+            (SYNTHETIC_DIR / "ct_2026_001_aditivo_01.docx").read_bytes(),
+        ),
+        (
+            "nfe_101_caso_b_regular.xml",
+            (SYNTHETIC_DIR / "nfe_101_caso_b_regular.xml").read_bytes(),
+        ),
+        (
+            "cobrancas_lote_ct_2026_001.csv",
+            (SYNTHETIC_DIR / "cobrancas_lote_ct_2026_001.csv").read_bytes(),
+        ),
+    ]
+    client = FakeLLMClient(
+        [
+            JuristaExtractionPayload(
+                rules=(
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.MONTHLY_PRICE,
+                        new_value=Decimal("10000.00"),
+                        validity_start=date(2026, 1, 1),
+                        validity_end=date(2026, 12, 31),
+                        relation=RuleRelation.CREATED,
+                        page=2,
+                        literal_excerpt=(
+                            "Cláusula 3ª: O valor mensal é de R$ 10.000,00 de 01/01/2026 até "
+                            "31/12/2026."
+                        ),
+                    ),
+                )
+            ),
+            JuristaExtractionPayload(
+                rules=(
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.MONTHLY_PRICE,
+                        new_value=Decimal("10800.00"),
+                        validity_start=date(2026, 5, 1),
+                        relation=RuleRelation.ALTERED,
+                        clause="Cláusula 1ª - Reajuste Contratual",
+                        paragraph="1",
+                        literal_excerpt=(
+                            "Pelo 1º Termo Aditivo ao contrato CT-2026-001, o valor mensal "
+                            "passa de R$ 10.000,00 para R$ 10.800,00 a partir de 01/05/2026."
+                        ),
+                    ),
+                )
+            ),
+        ]
+    )
+
+    with connect(db_path) as conn:
+        batch = ingest_uploaded_files(
+            conn,
+            files,
+            mode="AUTO",
+            selected_contract_id=None,
+            client=client,
+            received_at=_TS,
+        )
+        assert [c.id for c in batch.auto_registered_contracts] == ["CT-2026-001"]
+        assert batch.active_contract_id == "CT-2026-001"
+        assert len(batch.outcomes) == 4
+        assert len(fetch_contracts(conn)) == 1
+        assert len(fetch_documents(conn)) == 4
+        assert len(fetch_rules(conn, "CT-2026-001")) == 2
+        invoices = fetch_invoices(conn, "CT-2026-001")
+        assert len(invoices) >= 2
+
+        no_ai = ingest_uploaded_files(
+            conn,
+            [
+                (
+                    "contrato_escaneado_sem_texto.pdf",
+                    (SYNTHETIC_DIR / "contrato_escaneado_sem_texto.pdf").read_bytes(),
+                ),
+                ("arquivo.txt", b"conteudo qualquer"),
+            ],
+            mode="AUTO",
+            selected_contract_id="CT-2026-001",
+            client=None,
+            received_at=_TS,
+        )
+        assert no_ai.outcomes[0].document is not None
+        assert no_ai.outcomes[0].document.read_quality is ReadQuality.NO_TEXT
+        assert no_ai.outcomes[1].detected_kind == "SKIPPED"
+
+
+def test_delete_uploaded_document_removes_derived_entities_and_keeps_reviews(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "delete_docs.db"
+    init_db(db_path).close()
+
+    with connect(db_path) as conn:
+        seed_synthetic_demo(conn, SYNTHETIC_DIR, reviewed_at=_TS)
+        audit_stored_invoice(conn, "inv-demo-104")
+        reviews_before = fetch_reviews(conn)
+        assert len(reviews_before) >= 8
+
+        # Apagar documento do 2º Aditivo remove a regra do aditivo e o vínculo Amendment.
+        del_add2 = delete_uploaded_document(conn, "doc-ct-2026-001-add-02")
+        assert del_add2.deleted_rules == 1
+        assert del_add2.deleted_amendments == 1
+        assert len(fetch_amendments(conn, "CT-2026-001")) == 1
+
+        # Apagar NF-e 104 remove a cobrança e a auditoria associada.
+        del_nfe = delete_uploaded_document(conn, "doc-inv-demo-104")
+        assert del_nfe.deleted_invoices == 1
+        assert del_nfe.deleted_audits == 1
+        assert all(inv.id != "inv-demo-104" for inv in fetch_invoices(conn))
+
+        # Apagar todos os documentos restantes limpa documentos, regras e cobranças,
+        # preservando a trilha append-only em `reviews`.
+        deleted_rest = delete_all_uploaded_documents(conn, contract_id="CT-2026-001")
+        assert len(deleted_rest) >= 4
+        assert fetch_documents(conn, "CT-2026-001") == ()
+        assert fetch_rules(conn, "CT-2026-001") == ()
+        assert fetch_invoices(conn, "CT-2026-001") == ()
+        assert fetch_reviews(conn) == reviews_before
+
+        with pytest.raises(ValueError, match="não encontrado"):
+            delete_uploaded_document(conn, "doc-inexistente")
+
+
+def test_ingest_uploaded_files_handles_no_text_and_docx_without_cnpj_on_empty_db(
+    tmp_path: Path,
+) -> None:
+    # 1) PDF escaneado sem texto em banco vazio não pode ser descartado como SKIPPED.
+    db_no_text = tmp_path / "no_text.db"
+    init_db(db_no_text).close()
+    with connect(db_no_text) as conn:
+        res_no_text = ingest_uploaded_files(
+            conn,
+            [
+                (
+                    "contrato_escaneado_sem_texto.pdf",
+                    (SYNTHETIC_DIR / "contrato_escaneado_sem_texto.pdf").read_bytes(),
+                )
+            ],
+            selected_contract_id=None,
+            client=None,
+            received_at=_TS,
+        )
+        out = res_no_text.outcomes[0]
+        assert out.detected_kind == "CONTRACT"
+        assert out.document is not None
+        assert out.document.read_quality is ReadQuality.NO_TEXT
+        assert len(fetch_documents(conn)) == 1
+
+    # 2) DOCX sem CNPJ no texto auto-cria contrato provisório; PDF seguinte com CNPJ atualiza.
+    db_provisional = tmp_path / "provisional.db"
+    init_db(db_provisional).close()
+    with connect(db_provisional) as conn:
+        docx_client = FakeLLMClient(
+            [
+                JuristaExtractionPayload(
+                    rules=(
+                        ExtractedRuleCandidate(
+                            rule_type=RuleType.MONTHLY_PRICE,
+                            new_value=Decimal("5000.00"),
+                            validity_start=date(2026, 1, 1),
+                            validity_end=date(2026, 6, 30),
+                            relation=RuleRelation.CREATED,
+                            clause="Cláusula 2ª - Preço Mensal",
+                            paragraph="1",
+                            literal_excerpt=(
+                                "Pelos serviços de nuvem gerenciada sob o contrato CT-2026-002, a "
+                                "contratante pagará o valor mensal de R$ 5.000,00 de 01/01/2026 "
+                                "até 30/06/2026."
+                            ),
+                        ),
+                    )
+                )
+            ]
+        )
+        res_docx = ingest_uploaded_files(
+            conn,
+            [
+                (
+                    "ct_2026_002_contrato_armadilhas.docx",
+                    (SYNTHETIC_DIR / "ct_2026_002_contrato_armadilhas.docx").read_bytes(),
+                )
+            ],
+            selected_contract_id=None,
+            client=docx_client,
+            received_at=_TS,
+        )
+        assert res_docx.outcomes[0].detected_kind == "CONTRACT"
+        assert res_docx.outcomes[0].document is not None
+        assert res_docx.outcomes[0].rules_count == 1
+        ct2 = fetch_contract(conn, "CT-2026-002")
+        assert ct2 is not None
+        assert ct2.supplier_cnpj == "00000000000191"
+
+        add_client = FakeLLMClient(
+            [
+                JuristaExtractionPayload(
+                    rules=(
+                        ExtractedRuleCandidate(
+                            rule_type=RuleType.MONTHLY_PRICE,
+                            new_value=Decimal("5500.00"),
+                            validity_start=date(2026, 4, 15),
+                            relation=RuleRelation.ALTERED,
+                            page=1,
+                            literal_excerpt=(
+                                "Cláusula 1ª: Passa de R$ 5.000,00 para R$ 5.500,00 a "
+                                "partir de 15/04/2026."
+                            ),
+                        ),
+                    )
+                )
+            ]
+        )
+        res_add = ingest_uploaded_files(
+            conn,
+            [
+                (
+                    "ct_2026_002_aditivo_meio_periodo.pdf",
+                    (SYNTHETIC_DIR / "ct_2026_002_aditivo_meio_periodo.pdf").read_bytes(),
+                )
+            ],
+            selected_contract_id=None,
+            client=add_client,
+            received_at=_TS,
+        )
+        assert res_add.outcomes[0].contract_id == "CT-2026-002"
+        upgraded = fetch_contract(conn, "CT-2026-002")
+        assert upgraded is not None
+        assert upgraded.supplier_cnpj == "33000167000101"
+
+    # 3) Lote misto com dois contratos distintos + respectivas NF-es em banco vazio.
+    db_mixed = tmp_path / "mixed_batch.db"
+    init_db(db_mixed).close()
+    with connect(db_mixed) as conn:
+        mixed_client = FakeLLMClient(
+            [
+                JuristaExtractionPayload(
+                    rules=(
+                        ExtractedRuleCandidate(
+                            rule_type=RuleType.MONTHLY_PRICE,
+                            new_value=Decimal("10000.00"),
+                            validity_start=date(2026, 1, 1),
+                            validity_end=date(2026, 12, 31),
+                            relation=RuleRelation.CREATED,
+                            page=2,
+                            literal_excerpt=(
+                                "Cláusula 3ª: O valor mensal é de R$ 10.000,00 de 01/01/2026 "
+                                "até 31/12/2026."
+                            ),
+                        ),
+                    )
+                ),
+                JuristaExtractionPayload(
+                    rules=(
+                        ExtractedRuleCandidate(
+                            rule_type=RuleType.MONTHLY_PRICE,
+                            new_value=Decimal("5000.00"),
+                            validity_start=date(2026, 1, 1),
+                            validity_end=date(2026, 6, 30),
+                            relation=RuleRelation.CREATED,
+                            clause="Cláusula 2ª - Preço Mensal",
+                            paragraph="1",
+                            literal_excerpt=(
+                                "Pelos serviços de nuvem gerenciada sob o contrato CT-2026-002, a "
+                                "contratante pagará o valor mensal de R$ 5.000,00 de 01/01/2026 "
+                                "até 30/06/2026."
+                            ),
+                        ),
+                    )
+                ),
+            ]
+        )
+        mixed_res = ingest_uploaded_files(
+            conn,
+            [
+                (
+                    "ct_2026_001_contrato_base.pdf",
+                    (SYNTHETIC_DIR / "ct_2026_001_contrato_base.pdf").read_bytes(),
+                ),
+                (
+                    "ct_2026_002_contrato_armadilhas.docx",
+                    (SYNTHETIC_DIR / "ct_2026_002_contrato_armadilhas.docx").read_bytes(),
+                ),
+                (
+                    "nfe_101_caso_b_regular.xml",
+                    (SYNTHETIC_DIR / "nfe_101_caso_b_regular.xml").read_bytes(),
+                ),
+                (
+                    "nfe_201_meio_periodo.xml",
+                    (SYNTHETIC_DIR / "nfe_201_meio_periodo.xml").read_bytes(),
+                ),
+            ],
+            selected_contract_id=None,
+            client=mixed_client,
+            received_at=_TS,
+        )
+        assert {c.id for c in fetch_contracts(conn)} == {"CT-2026-001", "CT-2026-002"}
+        assert all(o.detected_kind != "SKIPPED" for o in mixed_res.outcomes)
+        by_num = {inv.number: inv.contract_id for inv in fetch_invoices(conn)}
+        assert by_num == {"101": "CT-2026-001", "201": "CT-2026-002"}
+
+
+def test_ingest_dossier_docx_auto_audits_divergence_and_cleans_up_empty_contract(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "dossier.db"
+    init_db(db_path).close()
+
+    dossier_bytes = build_synthetic_docx(
+        [
+            (
+                "Cláusula 1ª - Objeto e Preço",
+                [
+                    (
+                        "Contrato CT-2026-900 entre Empresa Teste S.A. e Fornecedor Dossiê Ltda. "
+                        "(CNPJ 11.222.333/0001-81). O valor mensal contratado é de R$ 10.000,00 "
+                        "desde 01/01/2026 até 31/12/2026."
+                    )
+                ],
+            ),
+            (
+                "Cobrança Associada",
+                [
+                    (
+                        "Fatura nº 901 referente à competência 2026-04: Mensalidade de suporte "
+                        "cobrada em R$ 12.000,00. Total da fatura: R$ 12.000,00."
+                    )
+                ],
+            ),
+        ]
+    )
+    dossier_client = FakeLLMClient(
+        [
+            JuristaExtractionPayload(
+                rules=(
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.MONTHLY_PRICE,
+                        new_value=Decimal("10000.00"),
+                        validity_start=date(2026, 1, 1),
+                        validity_end=date(2026, 12, 31),
+                        relation=RuleRelation.CREATED,
+                        clause="Cláusula 1ª - Objeto e Preço",
+                        paragraph="1",
+                        literal_excerpt=(
+                            "O valor mensal contratado é de R$ 10.000,00 desde 01/01/2026 até "
+                            "31/12/2026."
+                        ),
+                    ),
+                )
+            ),
+            FiscalExtractionPayload(
+                contract_id="CT-2026-900",
+                supplier="Fornecedor Dossiê Ltda.",
+                supplier_cnpj="11.222.333/0001-81",
+                number="901",
+                issue_date=date(2026, 4, 30),
+                reference_period=ReferencePeriod(year=2026, month=4),
+                total=Decimal("12000.00"),
+                page=1,
+                literal_excerpt="Total da fatura: R$ 12.000,00.",
+                items=(
+                    ExtractedBillingItemCandidate(
+                        description="Mensalidade de suporte",
+                        quantity=Decimal("1"),
+                        unit="mês",
+                        unit_value=Decimal("12000.00"),
+                        total_value=Decimal("12000.00"),
+                        literal_excerpt="Mensalidade de suporte cobrada em R$ 12.000,00.",
+                    ),
+                ),
+            ),
+        ]
+    )
+
+    with connect(db_path) as conn:
+        batch = ingest_uploaded_files(
+            conn,
+            [("dossie_teste_audit.docx", dossier_bytes)],
+            mode="AUTO",
+            selected_contract_id=None,
+            client=dossier_client,
+            received_at=_TS,
+        )
+        assert batch.active_contract_id == "CT-2026-900"
+        assert batch.outcomes[0].detected_kind == "DOSSIER"
+        assert batch.outcomes[0].rules_count == 1
+        assert batch.outcomes[0].invoices_count == 1
+        assert batch.audits_count == 1
+        assert batch.divergences_count == 1
+
+        saved_invoices = fetch_invoices(conn, "CT-2026-900")
+        assert len(saved_invoices) == 1
+        audits = fetch_audits(conn, saved_invoices[0].id)
+        assert len(audits) == 1
+        assert audits[0].result.classification is AuditClassification.NEEDS_REVIEW
+        assert audits[0].result.difference == Decimal("2000.00")
+
+        rules_900 = fetch_rules(conn, "CT-2026-900")
+        review_rule(
+            conn,
+            rules_900[0].id,
+            user="auditor.teste",
+            decision=ReviewDecision.CONFIRM,
+            justification="Regra confirmada contra o dossiê.",
+            reviewed_at=_TS,
+        )
+        confirmed_audit = audit_stored_invoice(conn, saved_invoices[0].id)
+        assert confirmed_audit.stored_audit.result.classification is AuditClassification.DIVERGENCE
+        assert confirmed_audit.stored_audit.result.difference == Decimal("2000.00")
+
+        # Não deve permitir apagar contrato enquanto houver documentos/regras/cobranças.
+        assert delete_empty_contract(conn, "CT-2026-900") is False
+
+        doc = batch.outcomes[0].document
+        assert doc is not None
+        deleted = delete_uploaded_document(conn, doc.id)
+        assert deleted.deleted_rules == 1
+        assert deleted.deleted_invoices == 1
+        assert deleted.deleted_audits == 1
+
+        assert delete_empty_contract(conn, "CT-2026-900") is True
+        assert fetch_contract(conn, "CT-2026-900") is None
+
+
+def test_ingest_realistic_commercial_dossier_pdf_with_masked_supplier_cnpj_and_four_invoices(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "realistic_dossier.db"
+    init_db(db_path).close()
+
+    dossier_pdf = build_synthetic_pdf(
+        [
+            [
+                "CONTRATO PARTICULAR DE PRESTAÇÃO DE SERVIÇOS",
+                "INSTRUMENTO Nº CS-047/2026",
+                "CONTRATANTE CONTRATADA",
+                "ATLAS ADMINISTRAÇÃO PREDIAL LTDA. NORTE SUL MANUTENÇÃO LTDA.",
+                "CNPJ: 12.345.678/0001-95 CNPJ: 45.781.236/0001-??",
+                "CLÁUSULA 3ª — DO PRAZO E DA VIGÊNCIA",
+                (
+                    "3.1. A vigência será de 12 meses de 02/09/2026 até 01/09/2027, "
+                    "prorrogável por termo aditivo."
+                ),
+                "CLÁUSULA 4ª — DO PREÇO",
+                "4.1. O valor mensal fixo é de R$ 18.750,00 a partir de 02/09/2026.",
+            ],
+            [
+                "ANEXO II — TERMO ADITIVO Nº 01",
+                (
+                    "2.2. A partir de 01/11/2026, o valor mensal passa de R$ 18.750,00 "
+                    "para R$ 19.200,00."
+                ),
+            ],
+            [
+                "ANEXO III — DEMONSTRATIVO DE FATURAMENTO",
+                "DOCUMENTOS FISCAIS — SETEMBRO A NOVEMBRO/2026",
+                "NF Emissão Competência Vencimento Descrição Valor",
+                (
+                    "NS-2026/091 30/09/2026 09/2026 10/10/2026 "
+                    "Serviços e materiais — mensalidade R$ 18.750,00"
+                ),
+                (
+                    "NS-2026/102 31/10/2026 10/2026 10/11/2026 "
+                    "Serviços e materiais — mensalidade R$ 18.750,00"
+                ),
+                (
+                    "NS-2026/113 30/11/2026 11/2026 10/12/2026 "
+                    "Serviços e materiais — mensalidade R$ 18.750,00"
+                ),
+                (
+                    "NS-2026/114 30/11/2026 11/2026 10/12/2026 "
+                    "Plantão adicional extraordinário R$ 900,00"
+                ),
+            ],
+        ]
+    )
+    client = FakeLLMClient(
+        [
+            JuristaExtractionPayload(
+                rules=(
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.MONTHLY_PRICE,
+                        new_value=Decimal("18750.00"),
+                        validity_start=date(2026, 9, 2),
+                        relation=RuleRelation.CREATED,
+                        page=1,
+                        literal_excerpt=(
+                            "4.1. O valor mensal fixo é de R$ 18.750,00 a partir de 02/09/2026."
+                        ),
+                    ),
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.MONTHLY_PRICE,
+                        new_value=Decimal("19200.00"),
+                        previous_value=Decimal("18750.00"),
+                        validity_start=date(2026, 11, 1),
+                        relation=RuleRelation.ALTERED,
+                        page=2,
+                        literal_excerpt=(
+                            "2.2. A partir de 01/11/2026, o valor mensal passa de R$ 18.750,00 "
+                            "para R$ 19.200,00."
+                        ),
+                    ),
+                )
+            ),
+            FiscalExtractionPayload(
+                contract_id="CS-047/2026",
+                supplier="Norte Sul Manutenção Ltda.",
+                supplier_cnpj="45.781.236/0001-??",
+                number="NS-2026/091",
+                issue_date=date(2026, 9, 30),
+                reference_period=ReferencePeriod(year=2026, month=9),
+                total=Decimal("18750.00"),
+                page=3,
+                literal_excerpt=(
+                    "NS-2026/091 30/09/2026 09/2026 10/10/2026 Serviços e materiais — mensalidade "
+                    "R$ 18.750,00"
+                ),
+                items=(
+                    ExtractedBillingItemCandidate(
+                        description="Serviços e materiais — mensalidade",
+                        quantity=Decimal("1"),
+                        unit="mês",
+                        unit_value=Decimal("18750.00"),
+                        total_value=Decimal("18750.00"),
+                        literal_excerpt=(
+                            "NS-2026/091 30/09/2026 09/2026 10/10/2026 Serviços e materiais — "
+                            "mensalidade R$ 18.750,00"
+                        ),
+                    ),
+                ),
+                additional_invoices=(
+                    ExtractedInvoiceEntry(
+                        contract_id="CS-047/2026",
+                        supplier="Norte Sul Manutenção Ltda.",
+                        supplier_cnpj="45.781.236/0001-??",
+                        number="NS-2026/102",
+                        issue_date=date(2026, 10, 31),
+                        reference_period=ReferencePeriod(year=2026, month=10),
+                        total=Decimal("18750.00"),
+                        page=3,
+                        literal_excerpt=(
+                            "NS-2026/102 31/10/2026 10/2026 10/11/2026 Serviços e materiais — "
+                            "mensalidade R$ 18.750,00"
+                        ),
+                        items=(
+                            ExtractedBillingItemCandidate(
+                                description="Serviços e materiais — mensalidade",
+                                quantity=Decimal("1"),
+                                unit="mês",
+                                unit_value=Decimal("18750.00"),
+                                total_value=Decimal("18750.00"),
+                                literal_excerpt=(
+                                    "NS-2026/102 31/10/2026 10/2026 10/11/2026 Serviços e "
+                                    "materiais — mensalidade R$ 18.750,00"
+                                ),
+                            ),
+                        ),
+                    ),
+                    ExtractedInvoiceEntry(
+                        contract_id="CS-047/2026",
+                        supplier="Norte Sul Manutenção Ltda.",
+                        supplier_cnpj="45.781.236/0001-??",
+                        number="NS-2026/113",
+                        issue_date=date(2026, 11, 30),
+                        reference_period=ReferencePeriod(year=2026, month=11),
+                        total=Decimal("18750.00"),
+                        page=3,
+                        literal_excerpt=(
+                            "NS-2026/113 30/11/2026 11/2026 10/12/2026 Serviços e materiais — "
+                            "mensalidade R$ 18.750,00"
+                        ),
+                        items=(
+                            ExtractedBillingItemCandidate(
+                                description="Serviços e materiais — mensalidade",
+                                quantity=Decimal("1"),
+                                unit="mês",
+                                unit_value=Decimal("18750.00"),
+                                total_value=Decimal("18750.00"),
+                                literal_excerpt=(
+                                    "NS-2026/113 30/11/2026 11/2026 10/12/2026 Serviços e "
+                                    "materiais — mensalidade R$ 18.750,00"
+                                ),
+                            ),
+                        ),
+                    ),
+                    ExtractedInvoiceEntry(
+                        contract_id="CS-047/2026",
+                        supplier="Norte Sul Manutenção Ltda.",
+                        supplier_cnpj="45.781.236/0001-??",
+                        number="NS-2026/114",
+                        issue_date=date(2026, 11, 30),
+                        reference_period=ReferencePeriod(year=2026, month=11),
+                        total=Decimal("900.00"),
+                        page=3,
+                        literal_excerpt=(
+                            "NS-2026/114 30/11/2026 11/2026 10/12/2026 Plantão adicional "
+                            "extraordinário R$ 900,00"
+                        ),
+                        items=(
+                            ExtractedBillingItemCandidate(
+                                description="Plantão adicional extraordinário",
+                                quantity=Decimal("1"),
+                                unit="un",
+                                unit_value=Decimal("900.00"),
+                                total_value=Decimal("900.00"),
+                                literal_excerpt=(
+                                    "NS-2026/114 30/11/2026 11/2026 10/12/2026 Plantão adicional "
+                                    "extraordinário R$ 900,00"
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ]
+    )
+
+    with connect(db_path) as conn:
+        # Simula contrato anterior selecionado na UI para garantir que CS-047/2026 não se misture.
+        register_contract(conn, _contract("CT-2026-002", cnpj="33.000.167/0001-01"))
+        batch = ingest_uploaded_files(
+            conn,
+            [("contrato_comercial_simulado_com_anexos.pdf", dossier_pdf)],
+            mode="AUTO",
+            selected_contract_id="CT-2026-002",
+            client=client,
+            received_at=_TS,
+        )
+        assert batch.outcomes[0].detected_kind == "DOSSIER"
+        assert batch.active_contract_id == "CS-047/2026"
+        assert batch.outcomes[0].invoices_count == 4
+        assert batch.audits_count == 4
+        assert any("45.781.236/0001-??" in msg for msg in batch.warnings)
+
+        cs_contract = fetch_contract(conn, "CS-047/2026")
+        assert cs_contract is not None
+        assert cs_contract.supplier_cnpj == "00000000000191"
+        assert fetch_invoices(conn, "CT-2026-002") == ()
+
+        cs_invoices = {inv.number: inv for inv in fetch_invoices(conn, "CS-047/2026")}
+        assert set(cs_invoices.keys()) == {
+            "NS-2026/091",
+            "NS-2026/102",
+            "NS-2026/113",
+            "NS-2026/114",
+        }
+
+        for rule in fetch_rules(conn, "CS-047/2026"):
+            review_rule(
+                conn,
+                rule.id,
+                user="auditor.teste",
+                decision=ReviewDecision.CONFIRM,
+                justification="Regra confirmada contra o dossiê.",
+                reviewed_at=_TS,
+            )
+
+        out_113 = audit_stored_invoice(conn, cs_invoices["NS-2026/113"].id)
+        assert out_113.stored_audit.result.classification is AuditClassification.DIVERGENCE
+        assert out_113.stored_audit.result.difference == Decimal("-450.00")
+
+        out_114 = audit_stored_invoice(conn, cs_invoices["NS-2026/114"].id)
+        assert out_114.stored_audit.result.classification is AuditClassification.NEEDS_REVIEW
+
+        # Exclusão individual de cobrança remove fatura e auditoria preservando trilha `reviews`
+        from backend.api import delete_stored_invoice, fetch_reviews
+
+        reviews_before_del = len(fetch_reviews(conn))
+        deleted_ok = delete_stored_invoice(conn, cs_invoices["NS-2026/114"].id)
+        assert deleted_ok is True
+        assert delete_stored_invoice(conn, "inexistente") is False
+        assert len(fetch_invoices(conn, "CS-047/2026")) == 3
+        assert len(fetch_audits(conn, cs_invoices["NS-2026/114"].id)) == 0
+        assert len(fetch_reviews(conn)) == reviews_before_del
