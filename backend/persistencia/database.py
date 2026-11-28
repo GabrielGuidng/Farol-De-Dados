@@ -13,6 +13,9 @@ TABLE_NAMES: tuple[str, ...] = (
     "billing_items",
     "audits",
     "reviews",
+    "payment_orders",
+    "tax_certificates",
+    "financial_summaries",
 )
 
 # Valores monetários, decimais e datas são guardados como TEXT (nunca REAL/FLOAT) para preservar
@@ -23,6 +26,10 @@ CREATE TABLE IF NOT EXISTS contracts (
     company TEXT NOT NULL,
     supplier TEXT NOT NULL,
     supplier_cnpj TEXT NOT NULL,
+    legal_nature TEXT,
+    bank_code TEXT,
+    bank_agency TEXT,
+    bank_account TEXT,
     subject TEXT NOT NULL,
     validity_start TEXT,
     validity_end TEXT,
@@ -49,6 +56,8 @@ CREATE TABLE IF NOT EXISTS rules (
     value TEXT,
     quantity TEXT,
     unit TEXT,
+    item_name TEXT,
+    quantity_scope TEXT,
     adjustment_index TEXT,
     periodicity_months INTEGER,
     validity_start TEXT,
@@ -84,12 +93,20 @@ CREATE TABLE IF NOT EXISTS invoices (
     contract_id TEXT,
     supplier TEXT NOT NULL,
     supplier_cnpj TEXT NOT NULL,
+    raw_supplier_cnpj TEXT,
+    supplier_legal_nature TEXT,
     number TEXT NOT NULL,
     issue_date TEXT NOT NULL,
+    attestation_date TEXT,
     reference_period TEXT NOT NULL,
     competence_inferred INTEGER NOT NULL DEFAULT 0,
     total TEXT NOT NULL,
+    inss_withheld TEXT,
+    iss_withheld TEXT,
+    net_total TEXT,
+    service_description TEXT,
     measured_hours TEXT,
+    expected_glosa TEXT,
     source TEXT NOT NULL
 );
 
@@ -140,7 +157,85 @@ BEFORE DELETE ON reviews
 BEGIN
     SELECT RAISE(ABORT, 'reviews is append-only');
 END;
+
+CREATE TABLE IF NOT EXISTS payment_orders (
+    id TEXT PRIMARY KEY,
+    contract_id TEXT,
+    source_document_id TEXT,
+    op_number TEXT NOT NULL,
+    payment_date TEXT NOT NULL,
+    invoice_number TEXT NOT NULL,
+    invoice_id TEXT,
+    beneficiary_name TEXT NOT NULL,
+    beneficiary_cnpj TEXT,
+    raw_beneficiary_cnpj TEXT,
+    bank_code TEXT,
+    bank_agency TEXT,
+    bank_account TEXT,
+    paid_amount TEXT NOT NULL,
+    requester_id TEXT,
+    approver_id TEXT,
+    approver_role TEXT,
+    approver_limit TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tax_certificates (
+    id TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL,
+    source_document_id TEXT,
+    certificate_type TEXT NOT NULL,
+    issue_date TEXT,
+    expiry_date TEXT NOT NULL,
+    raw_status TEXT
+);
+
+CREATE TABLE IF NOT EXISTS financial_summaries (
+    id TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL,
+    source_document_id TEXT NOT NULL,
+    competences_count INTEGER,
+    reported_contracted_total TEXT,
+    reported_gross_total TEXT,
+    reported_inss_total TEXT,
+    reported_iss_total TEXT,
+    reported_net_paid_total TEXT
+);
 """
+
+
+_COLUMN_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "contracts": (
+        ("legal_nature", "TEXT"),
+        ("bank_code", "TEXT"),
+        ("bank_agency", "TEXT"),
+        ("bank_account", "TEXT"),
+    ),
+    "rules": (
+        ("item_name", "TEXT"),
+        ("quantity_scope", "TEXT"),
+    ),
+    "invoices": (
+        ("raw_supplier_cnpj", "TEXT"),
+        ("supplier_legal_nature", "TEXT"),
+        ("attestation_date", "TEXT"),
+        ("inss_withheld", "TEXT"),
+        ("iss_withheld", "TEXT"),
+        ("net_total", "TEXT"),
+        ("service_description", "TEXT"),
+        ("expected_glosa", "TEXT"),
+    ),
+}
+
+
+def _ensure_column_migrations(conn: sqlite3.Connection) -> None:
+    """Adiciona colunas novas de forma idempotente em bancos SQLite pré-existentes."""
+    for table, specs in _COLUMN_MIGRATIONS.items():
+        existing = {
+            str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for col_name, col_type in specs:
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
 
 
 def connect(db_path: str | Path = ":memory:") -> sqlite3.Connection:
@@ -161,4 +256,5 @@ def init_db(target: sqlite3.Connection | str | Path = ":memory:") -> sqlite3.Con
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.executescript(SCHEMA_SQL)
+    _ensure_column_migrations(conn)
     return conn

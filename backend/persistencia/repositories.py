@@ -8,8 +8,11 @@ from backend.schemas import (
     Contract,
     ContractRule,
     Document,
+    DossierFinancialSummary,
     Evidence,
     Invoice,
+    PaymentOrder,
+    TaxCertificate,
     ValidityPeriod,
 )
 
@@ -19,12 +22,17 @@ def _rule_to_json(rule: ContractRule) -> str:
 
 
 def _row_to_contract(row: sqlite3.Row) -> Contract:
+    keys = row.keys()
     return Contract.model_validate(
         {
             "id": row["id"],
             "company": row["company"],
             "supplier": row["supplier"],
             "supplier_cnpj": row["supplier_cnpj"],
+            "legal_nature": row["legal_nature"] if "legal_nature" in keys else None,
+            "bank_code": row["bank_code"] if "bank_code" in keys else None,
+            "bank_agency": row["bank_agency"] if "bank_agency" in keys else None,
+            "bank_account": row["bank_account"] if "bank_account" in keys else None,
             "subject": row["subject"],
             "validity": ValidityPeriod.model_validate(
                 {"start": row["validity_start"], "end": row["validity_end"]}
@@ -41,13 +49,18 @@ def save_contract(conn: sqlite3.Connection, contract: Contract) -> None:
         conn.execute(
             """
             INSERT INTO contracts (
-                id, company, supplier, supplier_cnpj, subject,
-                validity_start, validity_end, comparison_tolerance, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, company, supplier, supplier_cnpj, legal_nature, bank_code,
+                bank_agency, bank_account, subject, validity_start, validity_end,
+                comparison_tolerance, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 company = excluded.company,
                 supplier = excluded.supplier,
                 supplier_cnpj = excluded.supplier_cnpj,
+                legal_nature = excluded.legal_nature,
+                bank_code = excluded.bank_code,
+                bank_agency = excluded.bank_agency,
+                bank_account = excluded.bank_account,
                 subject = excluded.subject,
                 validity_start = excluded.validity_start,
                 validity_end = excluded.validity_end,
@@ -59,6 +72,10 @@ def save_contract(conn: sqlite3.Connection, contract: Contract) -> None:
                 contract.company,
                 contract.supplier,
                 contract.supplier_cnpj,
+                contract.legal_nature,
+                contract.bank_code,
+                contract.bank_agency,
+                contract.bank_account,
                 contract.subject,
                 None if contract.validity.start is None else contract.validity.start.isoformat(),
                 None if contract.validity.end is None else contract.validity.end.isoformat(),
@@ -150,6 +167,7 @@ def list_documents(
 
 
 def _row_to_rule(row: sqlite3.Row) -> ContractRule:
+    keys = row.keys()
     evidence = Evidence.model_validate(
         {
             "source_document_id": row["source_document_id"],
@@ -167,6 +185,8 @@ def _row_to_rule(row: sqlite3.Row) -> ContractRule:
             "value": row["value"],
             "quantity": row["quantity"],
             "unit": row["unit"],
+            "item_name": row["item_name"] if "item_name" in keys else None,
+            "quantity_scope": row["quantity_scope"] if "quantity_scope" in keys else None,
             "adjustment_index": row["adjustment_index"],
             "periodicity_months": row["periodicity_months"],
             "validity": {"start": row["validity_start"], "end": row["validity_end"]},
@@ -183,16 +203,18 @@ def _upsert_rule(conn: sqlite3.Connection, rule: ContractRule) -> None:
     conn.execute(
         """
         INSERT INTO rules (
-            id, contract_id, rule_type, value, quantity, unit,
+            id, contract_id, rule_type, value, quantity, unit, item_name, quantity_scope,
             adjustment_index, periodicity_months, validity_start, validity_end,
             review_status, verification_score, relation, version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             contract_id = excluded.contract_id,
             rule_type = excluded.rule_type,
             value = excluded.value,
             quantity = excluded.quantity,
             unit = excluded.unit,
+            item_name = excluded.item_name,
+            quantity_scope = excluded.quantity_scope,
             adjustment_index = excluded.adjustment_index,
             periodicity_months = excluded.periodicity_months,
             validity_start = excluded.validity_start,
@@ -209,6 +231,8 @@ def _upsert_rule(conn: sqlite3.Connection, rule: ContractRule) -> None:
             None if rule.value is None else str(rule.value),
             None if rule.quantity is None else str(rule.quantity),
             rule.unit,
+            rule.item_name,
+            rule.quantity_scope,
             rule.adjustment_index,
             rule.periodicity_months,
             None if rule.validity.start is None else rule.validity.start.isoformat(),
@@ -359,6 +383,7 @@ def list_amendments(
 
 
 def _row_to_invoice(conn: sqlite3.Connection, row: sqlite3.Row) -> Invoice:
+    keys = row.keys()
     item_rows = conn.execute(
         """
         SELECT description, quantity, unit, unit_value, total_value
@@ -386,12 +411,24 @@ def _row_to_invoice(conn: sqlite3.Connection, row: sqlite3.Row) -> Invoice:
             "contract_id": row["contract_id"],
             "supplier": row["supplier"],
             "supplier_cnpj": row["supplier_cnpj"],
+            "raw_supplier_cnpj": row["raw_supplier_cnpj"] if "raw_supplier_cnpj" in keys else None,
+            "supplier_legal_nature": (
+                row["supplier_legal_nature"] if "supplier_legal_nature" in keys else None
+            ),
             "number": row["number"],
             "issue_date": row["issue_date"],
+            "attestation_date": row["attestation_date"] if "attestation_date" in keys else None,
             "reference_period": row["reference_period"],
             "competence_inferred": bool(row["competence_inferred"]),
             "total": row["total"],
+            "inss_withheld": row["inss_withheld"] if "inss_withheld" in keys else None,
+            "iss_withheld": row["iss_withheld"] if "iss_withheld" in keys else None,
+            "net_total": row["net_total"] if "net_total" in keys else None,
+            "service_description": (
+                row["service_description"] if "service_description" in keys else None
+            ),
             "measured_hours": row["measured_hours"],
+            "expected_glosa": row["expected_glosa"] if "expected_glosa" in keys else None,
             "source": row["source"],
             "items": items,
         }
@@ -404,19 +441,30 @@ def save_invoice(conn: sqlite3.Connection, invoice: Invoice) -> None:
         conn.execute(
             """
             INSERT INTO invoices (
-                id, contract_id, supplier, supplier_cnpj, number, issue_date,
-                reference_period, competence_inferred, total, measured_hours, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, contract_id, supplier, supplier_cnpj, raw_supplier_cnpj,
+                supplier_legal_nature, number, issue_date, attestation_date,
+                reference_period, competence_inferred, total, inss_withheld,
+                iss_withheld, net_total, service_description, measured_hours,
+                expected_glosa, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 contract_id = excluded.contract_id,
                 supplier = excluded.supplier,
                 supplier_cnpj = excluded.supplier_cnpj,
+                raw_supplier_cnpj = excluded.raw_supplier_cnpj,
+                supplier_legal_nature = excluded.supplier_legal_nature,
                 number = excluded.number,
                 issue_date = excluded.issue_date,
+                attestation_date = excluded.attestation_date,
                 reference_period = excluded.reference_period,
                 competence_inferred = excluded.competence_inferred,
                 total = excluded.total,
+                inss_withheld = excluded.inss_withheld,
+                iss_withheld = excluded.iss_withheld,
+                net_total = excluded.net_total,
+                service_description = excluded.service_description,
                 measured_hours = excluded.measured_hours,
+                expected_glosa = excluded.expected_glosa,
                 source = excluded.source
             """,
             (
@@ -424,12 +472,20 @@ def save_invoice(conn: sqlite3.Connection, invoice: Invoice) -> None:
                 invoice.contract_id,
                 invoice.supplier,
                 invoice.supplier_cnpj,
+                invoice.raw_supplier_cnpj,
+                invoice.supplier_legal_nature,
                 invoice.number,
                 invoice.issue_date.isoformat(),
+                None if invoice.attestation_date is None else invoice.attestation_date.isoformat(),
                 str(invoice.reference_period),
                 int(invoice.competence_inferred),
                 str(invoice.total),
+                None if invoice.inss_withheld is None else str(invoice.inss_withheld),
+                None if invoice.iss_withheld is None else str(invoice.iss_withheld),
+                None if invoice.net_total is None else str(invoice.net_total),
+                invoice.service_description,
                 None if invoice.measured_hours is None else str(invoice.measured_hours),
+                None if invoice.expected_glosa is None else str(invoice.expected_glosa),
                 invoice.source.value,
             ),
         )
@@ -469,3 +525,240 @@ def list_invoices(conn: sqlite3.Connection, contract_id: str | None = None) -> t
             (contract_id,),
         ).fetchall()
     return tuple(_row_to_invoice(conn, row) for row in rows)
+
+
+def _row_to_payment_order(row: sqlite3.Row) -> PaymentOrder:
+    return PaymentOrder.model_validate(
+        {
+            "id": row["id"],
+            "contract_id": row["contract_id"],
+            "source_document_id": row["source_document_id"],
+            "op_number": row["op_number"],
+            "payment_date": row["payment_date"],
+            "invoice_number": row["invoice_number"],
+            "invoice_id": row["invoice_id"],
+            "beneficiary_name": row["beneficiary_name"],
+            "beneficiary_cnpj": row["beneficiary_cnpj"],
+            "raw_beneficiary_cnpj": row["raw_beneficiary_cnpj"],
+            "bank_code": row["bank_code"],
+            "bank_agency": row["bank_agency"],
+            "bank_account": row["bank_account"],
+            "paid_amount": row["paid_amount"],
+            "requester_id": row["requester_id"],
+            "approver_id": row["approver_id"],
+            "approver_role": row["approver_role"],
+            "approver_limit": row["approver_limit"],
+        }
+    )
+
+
+def save_payment_order(conn: sqlite3.Connection, order: PaymentOrder) -> None:
+    """Salva ou atualiza uma ordem de pagamento preservando Decimal e datas."""
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO payment_orders (
+                id, contract_id, source_document_id, op_number, payment_date,
+                invoice_number, invoice_id, beneficiary_name, beneficiary_cnpj,
+                raw_beneficiary_cnpj, bank_code, bank_agency, bank_account,
+                paid_amount, requester_id, approver_id, approver_role, approver_limit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                contract_id = excluded.contract_id,
+                source_document_id = excluded.source_document_id,
+                op_number = excluded.op_number,
+                payment_date = excluded.payment_date,
+                invoice_number = excluded.invoice_number,
+                invoice_id = excluded.invoice_id,
+                beneficiary_name = excluded.beneficiary_name,
+                beneficiary_cnpj = excluded.beneficiary_cnpj,
+                raw_beneficiary_cnpj = excluded.raw_beneficiary_cnpj,
+                bank_code = excluded.bank_code,
+                bank_agency = excluded.bank_agency,
+                bank_account = excluded.bank_account,
+                paid_amount = excluded.paid_amount,
+                requester_id = excluded.requester_id,
+                approver_id = excluded.approver_id,
+                approver_role = excluded.approver_role,
+                approver_limit = excluded.approver_limit
+            """,
+            (
+                order.id,
+                order.contract_id,
+                order.source_document_id,
+                order.op_number,
+                order.payment_date.isoformat(),
+                order.invoice_number,
+                order.invoice_id,
+                order.beneficiary_name,
+                order.beneficiary_cnpj,
+                order.raw_beneficiary_cnpj,
+                order.bank_code,
+                order.bank_agency,
+                order.bank_account,
+                str(order.paid_amount),
+                order.requester_id,
+                order.approver_id,
+                order.approver_role,
+                None if order.approver_limit is None else str(order.approver_limit),
+            ),
+        )
+
+
+def list_payment_orders(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> tuple[PaymentOrder, ...]:
+    """Lista ordens de pagamento ordenadas cronologicamente."""
+    if contract_id is None:
+        rows = conn.execute(
+            "SELECT * FROM payment_orders ORDER BY payment_date ASC, op_number ASC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM payment_orders
+            WHERE contract_id = ?
+            ORDER BY payment_date ASC, op_number ASC
+            """,
+            (contract_id,),
+        ).fetchall()
+    return tuple(_row_to_payment_order(row) for row in rows)
+
+
+def _row_to_tax_certificate(row: sqlite3.Row) -> TaxCertificate:
+    return TaxCertificate.model_validate(
+        {
+            "id": row["id"],
+            "contract_id": row["contract_id"],
+            "source_document_id": row["source_document_id"],
+            "certificate_type": row["certificate_type"],
+            "issue_date": row["issue_date"],
+            "expiry_date": row["expiry_date"],
+            "raw_status": row["raw_status"],
+        }
+    )
+
+
+def save_tax_certificate(conn: sqlite3.Connection, certificate: TaxCertificate) -> None:
+    """Salva ou atualiza uma certidão de regularidade fiscal ou trabalhista."""
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO tax_certificates (
+                id, contract_id, source_document_id, certificate_type,
+                issue_date, expiry_date, raw_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                contract_id = excluded.contract_id,
+                source_document_id = excluded.source_document_id,
+                certificate_type = excluded.certificate_type,
+                issue_date = excluded.issue_date,
+                expiry_date = excluded.expiry_date,
+                raw_status = excluded.raw_status
+            """,
+            (
+                certificate.id,
+                certificate.contract_id,
+                certificate.source_document_id,
+                certificate.certificate_type.value,
+                None if certificate.issue_date is None else certificate.issue_date.isoformat(),
+                certificate.expiry_date.isoformat(),
+                certificate.raw_status,
+            ),
+        )
+
+
+def list_tax_certificates(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> tuple[TaxCertificate, ...]:
+    """Lista certidões de regularidade ordenadas por validade e tipo."""
+    if contract_id is None:
+        rows = conn.execute(
+            "SELECT * FROM tax_certificates ORDER BY certificate_type ASC, expiry_date ASC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM tax_certificates
+            WHERE contract_id = ?
+            ORDER BY certificate_type ASC, expiry_date ASC
+            """,
+            (contract_id,),
+        ).fetchall()
+    return tuple(_row_to_tax_certificate(row) for row in rows)
+
+
+def _row_to_financial_summary(row: sqlite3.Row) -> DossierFinancialSummary:
+    return DossierFinancialSummary.model_validate(
+        {
+            "id": row["id"],
+            "contract_id": row["contract_id"],
+            "source_document_id": row["source_document_id"],
+            "competences_count": row["competences_count"],
+            "reported_contracted_total": row["reported_contracted_total"],
+            "reported_gross_total": row["reported_gross_total"],
+            "reported_inss_total": row["reported_inss_total"],
+            "reported_iss_total": row["reported_iss_total"],
+            "reported_net_paid_total": row["reported_net_paid_total"],
+        }
+    )
+
+
+def save_financial_summary(conn: sqlite3.Connection, summary: DossierFinancialSummary) -> None:
+    """Salva ou atualiza um quadro de resumo financeiro extraído para reconciliação."""
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO financial_summaries (
+                id, contract_id, source_document_id, competences_count,
+                reported_contracted_total, reported_gross_total,
+                reported_inss_total, reported_iss_total, reported_net_paid_total
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                contract_id = excluded.contract_id,
+                source_document_id = excluded.source_document_id,
+                competences_count = excluded.competences_count,
+                reported_contracted_total = excluded.reported_contracted_total,
+                reported_gross_total = excluded.reported_gross_total,
+                reported_inss_total = excluded.reported_inss_total,
+                reported_iss_total = excluded.reported_iss_total,
+                reported_net_paid_total = excluded.reported_net_paid_total
+            """,
+            (
+                summary.id,
+                summary.contract_id,
+                summary.source_document_id,
+                summary.competences_count,
+                (
+                    None
+                    if summary.reported_contracted_total is None
+                    else str(summary.reported_contracted_total)
+                ),
+                (
+                    None
+                    if summary.reported_gross_total is None
+                    else str(summary.reported_gross_total)
+                ),
+                (None if summary.reported_inss_total is None else str(summary.reported_inss_total)),
+                (None if summary.reported_iss_total is None else str(summary.reported_iss_total)),
+                (
+                    None
+                    if summary.reported_net_paid_total is None
+                    else str(summary.reported_net_paid_total)
+                ),
+            ),
+        )
+
+
+def list_financial_summaries(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> tuple[DossierFinancialSummary, ...]:
+    """Lista quadros de resumo financeiro declarados em dossiês."""
+    if contract_id is None:
+        rows = conn.execute("SELECT * FROM financial_summaries ORDER BY id ASC").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM financial_summaries WHERE contract_id = ? ORDER BY id ASC",
+            (contract_id,),
+        ).fetchall()
+    return tuple(_row_to_financial_summary(row) for row in rows)
