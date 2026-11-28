@@ -20,6 +20,20 @@ DEFAULT_FALLBACK_MODELS: tuple[str, ...] = (
 DEFAULT_TIMEOUT_SECONDS = 45
 
 GeminiTransport = Callable[[str, str, str, str, type[BaseModel]], str]
+GeminiPdfTransport = Callable[[str, str, str, bytes, type[BaseModel]], str]
+
+
+class ScannedPdfPageText(StrictModel):
+    """Página transcrita por leitura multimodal de PDF escaneado."""
+
+    page_number: int = Field(ge=1)
+    text: str
+
+
+class ScannedPdfTranscriptionPayload(StrictModel):
+    """Saída estruturada da transcrição de PDF sem camada de texto."""
+
+    pages: tuple[ScannedPdfPageText, ...] = ()
 
 
 class LLMExecutionError(RuntimeError):
@@ -147,18 +161,29 @@ class GeminiLLMClient:
         config: LLMConfig,
         *,
         transport: GeminiTransport | None = None,
+        pdf_transport: GeminiPdfTransport | None = None,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if timeout_seconds < 1:
             raise ValueError("timeout_seconds deve ser maior ou igual a 1")
         if transport is None:
-            from backend.agentes.gemini_provider import create_gemini_transport
+            from backend.agentes.gemini_provider import (
+                create_gemini_pdf_transport,
+                create_gemini_transport,
+            )
 
             resolved = create_gemini_transport(timeout_seconds=timeout_seconds)
+            resolved_pdf = (
+                pdf_transport
+                if pdf_transport is not None
+                else create_gemini_pdf_transport(timeout_seconds=timeout_seconds)
+            )
         else:
             resolved = transport
+            resolved_pdf = pdf_transport
         self._config = config
         self._transport = resolved
+        self._pdf_transport = resolved_pdf
         self._preferred_model: str = config.model
 
     @classmethod
@@ -166,6 +191,7 @@ class GeminiLLMClient:
         cls,
         *,
         transport: GeminiTransport | None = None,
+        pdf_transport: GeminiPdfTransport | None = None,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
         env_file: Path | None = None,
         load_dotenv: bool = True,
@@ -174,6 +200,7 @@ class GeminiLLMClient:
         return cls(
             LLMConfig.from_env(env_file=env_file, load_dotenv=load_dotenv),
             transport=transport,
+            pdf_transport=pdf_transport,
             timeout_seconds=timeout_seconds,
         )
 
@@ -218,6 +245,51 @@ class GeminiLLMClient:
             f"todas as {total} chave(s) falharam nos modelos [{models_tried}]: {last_error}"
         ) from last_error
 
+    def transcribe_pdf(self, pdf_bytes: bytes) -> tuple[tuple[int, str], ...] | None:
+        """Transcreve texto página a página de PDF escaneado via transporte multimodal."""
+        if self._pdf_transport is None:
+            return None
+        all_models = (self._config.model, *self._config.fallback_models)
+        ordered_models = (
+            self._preferred_model,
+            *(m for m in all_models if m != self._preferred_model),
+        )
+        system_prompt = (
+            "Transcreva fielmente todo o texto legível de cada página deste PDF na ordem original, "
+            "preservando números, CNPJs, datas, tabelas e cláusulas sem inventar nem omitir dados."
+        )
+        last_error: LLMExecutionError | None = None
+        for candidate_model in ordered_models:
+            for api_key in self._config.api_keys:
+                try:
+                    content = self._pdf_transport(
+                        api_key,
+                        candidate_model,
+                        system_prompt,
+                        pdf_bytes,
+                        ScannedPdfTranscriptionPayload,
+                    )
+                    payload = ScannedPdfTranscriptionPayload.model_validate_json(content)
+                    self._preferred_model = candidate_model
+                    return tuple(
+                        (page.page_number, page.text.strip())
+                        for page in payload.pages
+                        if page.text.strip()
+                    )
+                except (LLMExecutionError, ValueError) as exc:
+                    last_error = (
+                        exc
+                        if isinstance(exc, LLMExecutionError)
+                        else LLMExecutionError(f"resposta inválida ao transcrever PDF: {exc}")
+                    )
+
+        api_key = "<redacted>"
+        total = len(self._config.api_keys)
+        models_tried = ", ".join(ordered_models)
+        raise LLMExecutionError(
+            f"todas as {total} chave(s) falharam ao transcrever PDF [{models_tried}]: {last_error}"
+        ) from last_error
+
 
 class FakeLLMClient:
     """Cliente falso para testes offline: devolve respostas pré-definidas (inclusive inválidas)."""
@@ -227,10 +299,17 @@ class FakeLLMClient:
         responses: Sequence[str | BaseModel | LLMExecutionError] = (),
         *,
         model: str = "fake-llm",
+        pdf_pages: Sequence[tuple[int, str]] | None = None,
     ) -> None:
         self._responses: deque[str | BaseModel | LLMExecutionError] = deque(responses)
         self._model = model
+        self._pdf_pages = tuple(pdf_pages) if pdf_pages is not None else None
         self.calls: list[RecordedLLMCall] = []
+
+    def transcribe_pdf(self, pdf_bytes: bytes) -> tuple[tuple[int, str], ...] | None:
+        """Retorna páginas pré-configuradas em testes offline de OCR, ou None por padrão."""
+        _ = pdf_bytes
+        return self._pdf_pages
 
     @property
     def model_name(self) -> str:

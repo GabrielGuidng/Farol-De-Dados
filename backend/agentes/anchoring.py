@@ -12,7 +12,17 @@ DEFAULT_CONFIDENCE_THRESHOLD = Decimal("0.85")
 
 _NUMBER_TOKEN = re.compile(r"(?<![A-Za-z0-9])[0-9]+(?:[.,][0-9]+)*")
 _TRANSITION_PATTERN = re.compile(
-    r"(?i)\bde\s+(?:R\$\s*)?(?P<old>[0-9][0-9.,]*)\s+para\s+(?:R\$\s*)?(?P<new>[0-9][0-9.,]*)"
+    r"(?i)\bde\s+(?:R\$\s*)?(?P<old>[0-9][0-9.,]*)(?:\s*\([^)]*\))?\s+"
+    r"para\s+(?:R\$\s*)?(?P<new>[0-9][0-9.,]*)"
+)
+_QUANTITY_DELTA_TRANSITION_RE = re.compile(
+    r"(?is)(?:acresc\w+|reduz\w+|suprim\w+|elevad\w+|aumentad\w+)[^.\n]{0,90}?"
+    r"\bem\s+(?P<delta>[0-9][0-9.,]*)(?:\s*\([^)]*\))?[^.\n]{0,90}?"
+    r"\bde\s+(?P<old>[0-9][0-9.,]*)(?:\s*\([^)]*\))?\s+para\s+(?P<new>[0-9][0-9.,]*)"
+)
+_QUANTITY_TRANSITION_NO_CURRENCY_RE = re.compile(
+    r"(?i)\bde\s+(?!R\$)(?P<old>[0-9][0-9.,]*)(?:\s*\([^)]*\))?\s+"
+    r"para\s+(?!R\$)(?P<new>[0-9][0-9.,]*)"
 )
 _PREVIOUS_PATTERN = re.compile(
     r"(?i)(?:antes(?:\s+era|\s+de)?|anteriormente(?:\s+de)?|"
@@ -112,9 +122,19 @@ def _value_matches_excerpt(
     validity_end: date | None,
 ) -> bool:
     excerpt_numbers = extract_numbers_from_text(literal_excerpt)
-    if rule_type in (RuleType.MONTHLY_PRICE, RuleType.OVERAGE_PRICE):
+    if rule_type is RuleType.ITEM_PRICE:
+        value_ok = new_value is not None and new_value in excerpt_numbers
+        qty_ok = quantity is None or quantity in excerpt_numbers
+        return value_ok and qty_ok
+    if rule_type in (
+        RuleType.MONTHLY_PRICE,
+        RuleType.OVERAGE_PRICE,
+        RuleType.INSS_RETENTION,
+        RuleType.ISS_RETENTION,
+        RuleType.APPROVAL_LIMIT,
+    ):
         return new_value is not None and new_value in excerpt_numbers
-    if rule_type is RuleType.FRANCHISE:
+    if rule_type in (RuleType.FRANCHISE, RuleType.PAYMENT_TERMS):
         return quantity is not None and quantity in excerpt_numbers
     if rule_type is RuleType.ADJUSTMENT:
         return (
@@ -132,6 +152,29 @@ def _value_matches_excerpt(
         )
         return any(marker in literal_excerpt for marker in markers)
     return False
+
+
+def resolve_transition_final_quantity(
+    literal_excerpt: str, extracted_quantity: Decimal | None
+) -> Decimal | None:
+    """Detecta se a quantidade extraída pegou a variação ou anterior em vez do novo total."""
+    if extracted_quantity is None:
+        return None
+    normalized = normalize_for_match(literal_excerpt)
+    for match in _QUANTITY_DELTA_TRANSITION_RE.finditer(normalized):
+        delta_val = _try_decimal(match.group("delta"))
+        old_val = _try_decimal(match.group("old"))
+        new_val = _try_decimal(match.group("new"))
+        if new_val is not None and extracted_quantity != new_val:
+            if extracted_quantity == delta_val or extracted_quantity == old_val:
+                return new_val
+    for match in _QUANTITY_TRANSITION_NO_CURRENCY_RE.finditer(normalized):
+        old_val = _try_decimal(match.group("old"))
+        new_val = _try_decimal(match.group("new"))
+        if old_val is not None and new_val is not None and old_val != new_val:
+            if extracted_quantity == old_val:
+                return new_val
+    return None
 
 
 def _captured_previous_value(literal_excerpt: str, new_value: Decimal | None) -> bool:
@@ -193,9 +236,16 @@ def verify_rule_anchoring(
         issues.append(AnchoringIssueCode.NEW_EQUALS_PREVIOUS)
         messages.append("O valor novo extraído é igual ao valor anterior citado.")
 
-    if _captured_previous_value(literal_excerpt, new_value):
+    if _captured_previous_value(literal_excerpt, new_value) or (
+        rule_type is RuleType.ITEM_PRICE
+        and quantity is not None
+        and resolve_transition_final_quantity(literal_excerpt, quantity) is not None
+    ):
         issues.append(AnchoringIssueCode.EXTRACTED_PREVIOUS_VALUE)
-        messages.append("O trecho indica que o valor extraído corresponde ao valor anterior.")
+        messages.append(
+            "O trecho indica que o valor ou quantidade extraída corresponde à variação ou "
+            "ao valor anterior, e não ao total vigente."
+        )
 
     passed = 4 - len(issues)
     score = Decimal("0.25") * passed

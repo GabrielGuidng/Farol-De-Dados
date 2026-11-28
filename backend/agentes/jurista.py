@@ -1,14 +1,16 @@
 """Agente Jurista: extrai regras contratuais e submete cada uma à verificação de ancoragem."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, ValidationError, model_validator
 
 from backend.agentes.anchoring import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     AnchoringCheckResult,
+    AnchoringIssueCode,
+    resolve_transition_final_quantity,
     verify_rule_anchoring,
 )
 from backend.agentes.client import LLMClient
@@ -62,6 +64,8 @@ class ExtractedRuleCandidate(StrictModel):
     previous_value: UnitPrice | None = None
     quantity: Quantity | None = None
     unit: NonEmptyStr | None = None
+    item_name: NonEmptyStr | None = None
+    quantity_scope: Literal["MONTHLY", "TOTAL"] | None = None
     adjustment_index: NonEmptyStr | None = None
     periodicity_months: int | None = Field(default=None, ge=1)
     validity_start: PlainDate | None = None
@@ -76,12 +80,21 @@ class ExtractedRuleCandidate(StrictModel):
     def _validate_locator_and_required_fields(self) -> Self:
         if self.page is None and (self.clause is None or self.paragraph is None):
             raise ValueError("regra extraída exige página ou cláusula e parágrafo")
-        if self.rule_type in (RuleType.MONTHLY_PRICE, RuleType.OVERAGE_PRICE) and (
-            self.new_value is None
+        if self.rule_type in (
+            RuleType.MONTHLY_PRICE,
+            RuleType.ITEM_PRICE,
+            RuleType.OVERAGE_PRICE,
+            RuleType.INSS_RETENTION,
+            RuleType.ISS_RETENTION,
+            RuleType.APPROVAL_LIMIT,
+        ) and (self.new_value is None):
+            raise ValueError("regra de valor/aliquota/alcada exige new_value")
+        if self.rule_type is RuleType.ITEM_PRICE and self.item_name is None:
+            raise ValueError("regra ITEM_PRICE exige item_name")
+        if self.rule_type in (RuleType.FRANCHISE, RuleType.PAYMENT_TERMS) and (
+            self.quantity is None
         ):
-            raise ValueError("regra de preço exige new_value")
-        if self.rule_type is RuleType.FRANCHISE and self.quantity is None:
-            raise ValueError("franquia exige quantity")
+            raise ValueError("franquia ou prazo de pagamento exige quantity")
         if self.rule_type is RuleType.ADJUSTMENT and self.adjustment_index is None:
             raise ValueError("reajuste exige adjustment_index")
         if self.rule_type is RuleType.EXTENSION and self.validity_end is None:
@@ -175,6 +188,39 @@ def _prepare_masked_content(payload: JuristaInput) -> tuple[str, dict[int, str] 
     return "\n\n".join(blocks), None
 
 
+def _drop_redundant_monthly_price(
+    rules: list[ContractRule],
+    anchoring_results: list[AnchoringCheckResult],
+) -> tuple[list[ContractRule], list[AnchoringCheckResult]]:
+    """Remove MONTHLY_PRICE redundante quando há ITEM_PRICE mensal somando o mesmo valor."""
+    by_start: dict[date | None, Decimal] = {}
+    for rule in rules:
+        if (
+            rule.rule_type is RuleType.ITEM_PRICE
+            and rule.quantity_scope in (None, "MONTHLY")
+            and rule.value is not None
+            and rule.quantity is not None
+        ):
+            by_start[rule.validity.start] = by_start.get(rule.validity.start, Decimal("0.00")) + (
+                rule.value * rule.quantity
+            )
+
+    kept_rules: list[ContractRule] = []
+    kept_anchoring: list[AnchoringCheckResult] = []
+    for rule, anc in zip(rules, anchoring_results, strict=True):
+        item_sum = by_start.get(rule.validity.start)
+        if (
+            rule.rule_type is RuleType.MONTHLY_PRICE
+            and item_sum is not None
+            and rule.value is not None
+            and abs(rule.value - item_sum) <= Decimal("0.05")
+        ):
+            continue
+        kept_rules.append(rule)
+        kept_anchoring.append(anc)
+    return kept_rules, kept_anchoring
+
+
 def run_jurista_agent(
     payload: JuristaInput,
     client: LLMClient,
@@ -264,19 +310,42 @@ def run_jurista_agent(
     warnings: list[str] = []
 
     for index, candidate in enumerate(parsed.rules, start=1):
+        effective_qty = candidate.quantity
         anchoring = verify_rule_anchoring(
             rule_type=candidate.rule_type,
             literal_excerpt=candidate.literal_excerpt,
             document_text=document_text,
             new_value=candidate.new_value,
             previous_value=candidate.previous_value,
-            quantity=candidate.quantity,
+            quantity=effective_qty,
             adjustment_index=candidate.adjustment_index,
             validity_end=candidate.validity_end,
             page=candidate.page,
             pages_by_number=masked_pages,
             confidence_threshold=confidence_threshold,
         )
+        if (
+            candidate.rule_type is RuleType.ITEM_PRICE
+            and AnchoringIssueCode.EXTRACTED_PREVIOUS_VALUE in anchoring.issues
+        ):
+            resolved_qty = resolve_transition_final_quantity(
+                candidate.literal_excerpt, effective_qty
+            )
+            if resolved_qty is not None:
+                effective_qty = resolved_qty
+                anchoring = verify_rule_anchoring(
+                    rule_type=candidate.rule_type,
+                    literal_excerpt=candidate.literal_excerpt,
+                    document_text=document_text,
+                    new_value=candidate.new_value,
+                    previous_value=candidate.previous_value,
+                    quantity=effective_qty,
+                    adjustment_index=candidate.adjustment_index,
+                    validity_end=candidate.validity_end,
+                    page=candidate.page,
+                    pages_by_number=masked_pages,
+                    confidence_threshold=confidence_threshold,
+                )
         evidence = Evidence(
             source_document_id=payload.document_id,
             page=candidate.page,
@@ -289,8 +358,10 @@ def run_jurista_agent(
             contract_id=payload.contract_id,
             rule_type=candidate.rule_type,
             value=candidate.new_value,
-            quantity=candidate.quantity,
+            quantity=effective_qty,
             unit=candidate.unit,
+            item_name=candidate.item_name,
+            quantity_scope=candidate.quantity_scope,
             adjustment_index=candidate.adjustment_index,
             periodicity_months=candidate.periodicity_months,
             validity=ValidityPeriod(start=candidate.validity_start, end=candidate.validity_end),
@@ -309,6 +380,8 @@ def run_jurista_agent(
             warnings.append(
                 f"Regra {rule.id} abaixo do limiar de confiança ({anchoring.verification_score})."
             )
+
+    rules, anchoring_results = _drop_redundant_monthly_price(rules, anchoring_results)
 
     return JuristaResult(
         rules=tuple(rules),

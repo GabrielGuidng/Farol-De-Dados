@@ -7,6 +7,7 @@ from backend.agentes.anchoring import (
     excerpt_exists_in_document,
     extract_numbers_from_text,
     normalize_for_match,
+    resolve_transition_final_quantity,
     verify_rule_anchoring,
 )
 from backend.agentes.client import (
@@ -182,6 +183,7 @@ __all__ = [
     "load_invoice_state",
     "normalize_for_match",
     "parse_dotenv_file",
+    "resolve_transition_final_quantity",
     "review_ambiguous_links_node",
     "run_fiscal_pdf_agent",
     "run_invoice_motor_node",

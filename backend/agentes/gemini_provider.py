@@ -12,7 +12,7 @@ try:
 except ImportError:
     _HTTP_ERROR_TYPES = (httpx.HTTPError,)
 
-from backend.agentes.client import GeminiTransport, LLMExecutionError
+from backend.agentes.client import GeminiPdfTransport, GeminiTransport, LLMExecutionError
 
 DEFAULT_TIMEOUT_SECONDS = 45
 
@@ -137,3 +137,65 @@ def create_gemini_transport(*, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -
         return response.text
 
     return _transport
+
+
+def create_gemini_pdf_transport(
+    *, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+) -> GeminiPdfTransport:
+    """Cria transporte multimodal síncrono para transcrição de PDF escaneado no Gemini."""
+    if timeout_seconds < 1:
+        raise ValueError("timeout_seconds deve ser maior ou igual a 1")
+    timeout_ms = max(timeout_seconds, 10) * 1000
+
+    def _pdf_transport(
+        api_key: str,
+        model: str,
+        system_prompt: str,
+        pdf_bytes: bytes,
+        response_schema: type[BaseModel],
+    ) -> str:
+        from google import genai
+        from google.genai import errors as genai_errors
+        from google.genai import types
+
+        json_schema = build_gemini_json_schema(response_schema)
+        try:
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(
+                    timeout=timeout_ms,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
+            pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    pdf_part,
+                    "Transcreva página por página todo o texto visível deste PDF.",
+                ],
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    response_json_schema=json_schema,
+                    temperature=0.0,
+                ),
+            )
+        except (
+            genai_errors.APIError,
+            *_HTTP_ERROR_TYPES,
+            TimeoutError,
+            OSError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            api_key = "<redacted>"
+            raise LLMExecutionError(
+                f"falha multimodal ao ler PDF no modelo {model}: {exc}"
+            ) from exc
+
+        if not response.text:
+            raise LLMExecutionError(f"resposta vazia ao transcrever PDF no modelo {model}")
+        return response.text
+
+    return _pdf_transport

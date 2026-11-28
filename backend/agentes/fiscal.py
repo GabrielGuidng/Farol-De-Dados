@@ -1,6 +1,8 @@
 """Agente Fiscal para faturas em PDF (XML e planilhas usam os parsers do Épico 4)."""
 
+import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Self
 
 from pydantic import Field, ValidationError
@@ -24,7 +26,6 @@ from backend.schemas import (
     ReadQuality,
     ReferencePeriod,
     StrictModel,
-    UnitPrice,
     is_valid_cnpj,
     normalize_cnpj,
 )
@@ -34,6 +35,15 @@ _NO_TEXT_WARNING = (
     "PDF de cobrança sem camada de texto legível; o Agente Fiscal não processou o arquivo."
 )
 _PROVISIONAL_FISCAL_CNPJ = "00000000000191"
+_DADOS_ADICIONAIS_RE = re.compile(
+    r"(?is)DADOS\s+ADICIONAIS\s*\n\s*(?P<txt>[^\n]+(?:\n(?!(?:DANFE|NF-e|P[áa]g\.))[^\n]+)?)"
+)
+_PAGE_CONTRACT_REF_RE = re.compile(
+    r"(?i)\b(?:Ata\s+de\s+Registro\s+de\s+Pre[çc]os|Contrato(?:\s+de\s+Loca[çc][ãa]o"
+    r"(?:\s+N[ãa]o\s+Residencial)?)?|Termo\s+de\s+Contrato|ARP)\s*(?:n[º°.]?|n[úu]mero)?\s*"
+    r"([A-Z]{0,6}-?\d{2,6}/\d{4})\b"
+)
+_DISCOUNT_WORD_RE = re.compile(r"(?i)\b(?:desconto|glosa|abatimento|sla)\b")
 
 
 class ExtractedBillingItemCandidate(StrictModel):
@@ -42,8 +52,8 @@ class ExtractedBillingItemCandidate(StrictModel):
     description: NonEmptyStr
     quantity: Quantity
     unit: NonEmptyStr | None = None
-    unit_value: UnitPrice
-    total_value: Money
+    unit_value: Decimal
+    total_value: Decimal
     literal_excerpt: NonEmptyStr
 
 
@@ -53,10 +63,16 @@ class ExtractedInvoiceEntry(StrictModel):
     contract_id: EntityId | None = None
     supplier: NonEmptyStr
     supplier_cnpj: str | None = None
+    supplier_legal_nature: str | None = None
     number: NonEmptyStr
     issue_date: PlainDate
+    attestation_date: PlainDate | None = None
     reference_period: ReferencePeriod | None = None
     total: Money
+    inss_withheld: Money | None = None
+    iss_withheld: Money | None = None
+    net_total: Money | None = None
+    service_description: str | None = None
     measured_hours: Quantity | None = None
     page: int = Field(default=1, ge=1)
     literal_excerpt: NonEmptyStr
@@ -69,10 +85,16 @@ class FiscalExtractionPayload(StrictModel):
     contract_id: EntityId | None = None
     supplier: NonEmptyStr
     supplier_cnpj: str | None = None
+    supplier_legal_nature: str | None = None
     number: NonEmptyStr
     issue_date: PlainDate
+    attestation_date: PlainDate | None = None
     reference_period: ReferencePeriod | None = None
     total: Money
+    inss_withheld: Money | None = None
+    iss_withheld: Money | None = None
+    net_total: Money | None = None
+    service_description: str | None = None
     measured_hours: Quantity | None = None
     page: int = Field(ge=1)
     literal_excerpt: NonEmptyStr
@@ -138,6 +160,58 @@ class FiscalResult(StrictModel):
     warnings: tuple[str, ...] = ()
     attempts: int = Field(default=0, ge=0)
     metadata: ExtractionMetadata
+
+
+def _is_goods_danfe_page(page_text: str, service_description: str | None) -> bool:
+    combined = f"{page_text}\n{service_description or ''}".casefold()
+    if (
+        "nfs-e" in combined
+        or "nota fiscal de serviços" in combined
+        or "nota fiscal de servicos" in combined
+    ):
+        return False
+    return any(
+        marker in combined
+        for marker in ("danfe", "venda de mercadoria", "entrega conforme af", "af-")
+    )
+
+
+def _enrich_service_description_from_page(
+    current: str | None,
+    page_text: str,
+) -> str | None:
+    if not page_text.strip():
+        return current
+    additions: list[str] = []
+    m_dados = _DADOS_ADICIONAIS_RE.search(page_text)
+    if m_dados is not None:
+        raw_dados = " ".join(m_dados.group("txt").split())
+        if raw_dados and (current is None or raw_dados.casefold() not in current.casefold()):
+            additions.append(raw_dados)
+    for m_ref in _PAGE_CONTRACT_REF_RE.finditer(page_text):
+        snippet = " ".join(m_ref.group(0).split())
+        if current is None or m_ref.group(1).casefold() not in current.casefold():
+            if all(m_ref.group(1).casefold() not in a.casefold() for a in additions):
+                additions.append(snippet)
+    if not additions:
+        return current
+    if current and current.strip():
+        return f"{current.strip()} | {' | '.join(additions)}"
+    return " | ".join(additions)
+
+
+def _try_reconstruct_wrapped_cnpj(raw_cnpj: str, page_text: str) -> str | None:
+    digits = normalize_cnpj(raw_cnpj)
+    if len(digits) != 13 or not page_text:
+        return None
+    formatted_13 = rf"{digits[:2]}\.?{digits[2:5]}\.?{digits[5:8]}/?{digits[8:12]}-?{digits[12]}"
+    for m in re.finditer(formatted_13 + r"(?![0-9])([\s\S]{0,90})", page_text):
+        tail_digits = re.findall(r"(?<![0-9/.-])(\d)\b", m.group(1))
+        for td in tail_digits[:2]:
+            candidate = digits + td
+            if is_valid_cnpj(candidate):
+                return candidate
+    return None
 
 
 def run_fiscal_pdf_agent(
@@ -218,10 +292,16 @@ def run_fiscal_pdf_agent(
             contract_id=parsed.contract_id,
             supplier=parsed.supplier,
             supplier_cnpj=parsed.supplier_cnpj,
+            supplier_legal_nature=parsed.supplier_legal_nature,
             number=parsed.number,
             issue_date=parsed.issue_date,
+            attestation_date=parsed.attestation_date,
             reference_period=parsed.reference_period,
             total=parsed.total,
+            inss_withheld=parsed.inss_withheld,
+            iss_withheld=parsed.iss_withheld,
+            net_total=parsed.net_total,
+            service_description=parsed.service_description,
             measured_hours=parsed.measured_hours,
             page=parsed.page,
             literal_excerpt=parsed.literal_excerpt,
@@ -234,8 +314,13 @@ def run_fiscal_pdf_agent(
     anchoring_valid = True
     built_invoices: list[Invoice] = []
 
+    raw_pages_by_num = {page.page_number: page.text for page in payload.pages}
     for idx, entry in enumerate(raw_entries, start=1):
-        competence_inferred = entry.reference_period is None
+        page_text = raw_pages_by_num.get(entry.page, "")
+        enriched_desc = _enrich_service_description_from_page(entry.service_description, page_text)
+        competence_inferred = entry.reference_period is None and not _is_goods_danfe_page(
+            page_text, enriched_desc
+        )
         reference_period = (
             entry.reference_period
             if entry.reference_period is not None
@@ -249,20 +334,25 @@ def run_fiscal_pdf_agent(
             )
 
         raw_cnpj = (entry.supplier_cnpj or "").strip()
-        if raw_cnpj and is_valid_cnpj(raw_cnpj):
-            resolved_cnpj = normalize_cnpj(raw_cnpj)
-        else:
-            resolved_cnpj = _PROVISIONAL_FISCAL_CNPJ
-            if raw_cnpj:
+        if raw_cnpj and not is_valid_cnpj(raw_cnpj):
+            rebuilt = _try_reconstruct_wrapped_cnpj(raw_cnpj, page_text)
+            if rebuilt is not None:
+                resolved_cnpj = rebuilt
+                raw_cnpj = rebuilt
+            else:
+                resolved_cnpj = _PROVISIONAL_FISCAL_CNPJ
                 warnings.append(
                     f"CNPJ do emitente na cobrança {entry.number} ('{raw_cnpj}') está incompleto "
                     "ou inválido; utilizado CNPJ provisório para permitir revisão e auditoria."
                 )
-            else:
-                warnings.append(
-                    f"CNPJ do emitente ausente na cobrança {entry.number}; utilizado CNPJ "
-                    "provisório para permitir revisão e auditoria."
-                )
+        elif raw_cnpj and is_valid_cnpj(raw_cnpj):
+            resolved_cnpj = normalize_cnpj(raw_cnpj)
+        else:
+            resolved_cnpj = _PROVISIONAL_FISCAL_CNPJ
+            warnings.append(
+                f"CNPJ do emitente ausente na cobrança {entry.number}; utilizado CNPJ "
+                "provisório para permitir revisão e auditoria."
+            )
 
         entry_anchoring = excerpt_exists_in_document(
             entry.literal_excerpt,
@@ -272,24 +362,29 @@ def run_fiscal_pdf_agent(
         ) and entry.total in extract_numbers_from_text(entry.literal_excerpt)
 
         for item in entry.items:
-            item_ok = excerpt_exists_in_document(
-                item.literal_excerpt, document_text
-            ) and item.total_value in extract_numbers_from_text(item.literal_excerpt)
+            item_ok = excerpt_exists_in_document(item.literal_excerpt, document_text) and abs(
+                item.total_value
+            ) in extract_numbers_from_text(item.literal_excerpt)
             if not item_ok:
                 entry_anchoring = False
         if not entry_anchoring:
             anchoring_valid = False
 
-        items = tuple(
-            BillingItem(
-                description=item.description,
-                quantity=item.quantity,
-                unit=item.unit,
-                unit_value=item.unit_value,
-                total_value=item.total_value,
+        items: list[BillingItem] = []
+        for item in entry.items:
+            is_negative = item.total_value < Decimal("0") or item.unit_value < Decimal("0")
+            desc = item.description
+            if is_negative and not _DISCOUNT_WORD_RE.search(desc):
+                desc = f"Desconto / glosa — {desc}"
+            items.append(
+                BillingItem(
+                    description=desc,
+                    quantity=abs(item.quantity),
+                    unit=item.unit,
+                    unit_value=abs(item.unit_value),
+                    total_value=abs(item.total_value),
+                )
             )
-            for item in entry.items
-        )
         inv_id = f"pdf-{payload.document_id}" if idx == 1 else f"pdf-{payload.document_id}-{idx}"
         built_invoices.append(
             Invoice(
@@ -297,14 +392,21 @@ def run_fiscal_pdf_agent(
                 contract_id=entry.contract_id,
                 supplier=entry.supplier,
                 supplier_cnpj=resolved_cnpj,
+                raw_supplier_cnpj=raw_cnpj or None,
+                supplier_legal_nature=entry.supplier_legal_nature,
                 number=entry.number,
                 issue_date=entry.issue_date,
+                attestation_date=entry.attestation_date,
                 reference_period=reference_period,
                 competence_inferred=competence_inferred,
                 total=entry.total,
+                inss_withheld=entry.inss_withheld,
+                iss_withheld=entry.iss_withheld,
+                net_total=entry.net_total,
+                service_description=enriched_desc,
                 measured_hours=entry.measured_hours,
                 source=InvoiceSource.PDF,
-                items=items,
+                items=tuple(items),
             )
         )
 
