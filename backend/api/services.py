@@ -2,6 +2,7 @@
 
 import re
 import sqlite3
+from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -21,6 +22,7 @@ from backend.agentes import (
     JuristaExtractionPayload,
     JuristaInput,
     LLMClient,
+    LLMExecutionError,
     TradutorResult,
     build_invoice_report_node,
     fetch_invoice_rules_node,
@@ -30,21 +32,35 @@ from backend.agentes import (
     run_jurista_agent,
 )
 from backend.leitura import (
+    DEFAULT_MIN_TEXT_CHARS,
     DocxReadResult,
+    PdfPage,
     PdfReadResult,
     UnsafeXmlError,
+    detect_spreadsheet_kind,
+    extract_dossier_artifacts,
+    has_structured_financial_sections,
+    has_supplemental_contract_rules,
+    import_certificates_csv,
+    import_certificates_xlsx,
     import_invoices_csv,
     import_invoices_xlsx,
+    import_payment_orders_csv,
+    import_payment_orders_xlsx,
     parse_nfe,
     parse_nfse,
     read_docx,
     read_pdf,
 )
 from backend.motor import (
+    PaymentCycleAuditResult,
+    PaymentFinding,
     RuleSelection,
     TimelineResult,
     apply_amendments,
     audit_invoice,
+    audit_payment_cycle,
+    normalize_item_key,
     select_applicable_rule,
 )
 from backend.persistencia import (
@@ -59,9 +75,12 @@ from backend.persistencia import (
     list_audits,
     list_contracts,
     list_documents,
+    list_financial_summaries,
     list_invoices,
+    list_payment_orders,
     list_reviews,
     list_rules,
+    list_tax_certificates,
     receive_document,
     record_audit_review,
     record_document_review,
@@ -70,21 +89,27 @@ from backend.persistencia import (
     save_audit,
     save_contract,
     save_document,
+    save_financial_summary,
     save_invoice,
+    save_payment_order,
     save_rule,
+    save_tax_certificate,
 )
 from backend.schemas import (
     Amendment,
     AuditClassification,
     AuditResult,
+    Check,
     Contract,
     ContractRule,
     ContractStatus,
     Document,
     DocumentType,
+    DossierFinancialSummary,
     HumanReview,
     Invoice,
     InvoiceSource,
+    PaymentOrder,
     ReadQuality,
     ReferencePeriod,
     ReviewDecision,
@@ -93,6 +118,7 @@ from backend.schemas import (
     RuleRelation,
     RuleType,
     StrictModel,
+    TaxCertificate,
     ValidityPeriod,
     is_valid_cnpj,
     normalize_cnpj,
@@ -275,6 +301,374 @@ def fetch_amendments(
     )
 
 
+def fetch_payment_orders(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> tuple[PaymentOrder, ...]:
+    """Lista ordens de pagamento cadastradas, opcionalmente filtradas por contrato."""
+    return list_payment_orders(conn, contract_id=contract_id)
+
+
+def fetch_tax_certificates(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> tuple[TaxCertificate, ...]:
+    """Lista certidões de regularidade, opcionalmente filtradas por contrato."""
+    return list_tax_certificates(conn, contract_id=contract_id)
+
+
+def fetch_financial_summaries(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> tuple[DossierFinancialSummary, ...]:
+    """Lista quadros de resumo financeiro extraídos de dossiês."""
+    return list_financial_summaries(conn, contract_id=contract_id)
+
+
+AUTO_APPROVE_USER = "sistema.auto"
+AUTO_APPROVE_CONFIDENCE_THRESHOLD = Decimal("0.85")
+
+
+def _auto_approve_high_confidence_rules(
+    conn: sqlite3.Connection,
+    rules: Sequence[ContractRule],
+    *,
+    threshold: Decimal = AUTO_APPROVE_CONFIDENCE_THRESHOLD,
+    reviewed_at: datetime,
+) -> tuple[tuple[ContractRule, ...], int]:
+    """Confirma automaticamente regras extraídas com confiança acima do limiar configurado."""
+    updated: list[ContractRule] = []
+    auto_count = 0
+    for rule in rules:
+        if (
+            rule.review_status is ReviewStatus.PENDING_REVIEW
+            and rule.verification_score is not None
+            and rule.verification_score > threshold
+        ):
+            pct = int(rule.verification_score * Decimal("100"))
+            rev = review_rule(
+                conn,
+                rule.id,
+                user=AUTO_APPROVE_USER,
+                decision=ReviewDecision.CONFIRM,
+                justification=(
+                    f"Aprovada automaticamente (confiança {pct}% > 85%); "
+                    "disponível para revisão ou alteração posterior."
+                ),
+                reviewed_at=reviewed_at,
+            )
+            updated.append(rev.rule)
+            auto_count += 1
+        else:
+            updated.append(rule)
+    return tuple(updated), auto_count
+
+
+def sync_contract_dossier_data(
+    conn: sqlite3.Connection,
+    contract_id: str,
+    *,
+    auto_approve_above_threshold: bool = False,
+) -> None:
+    """
+    Sincroniza de forma idempotente metadados bancários, retenções de NFs, glosas, OPs,
+    certidões, tabelas de itens/postos e resumo financeiro dos documentos recebidos.
+    """
+    contract = get_contract(conn, contract_id)
+    if contract is None:
+        return
+
+    docs = list_documents(conn, contract_id)
+    contract_docs = sorted(
+        (
+            doc
+            for doc in docs
+            if doc.document_type in (DocumentType.CONTRACT, DocumentType.AMENDMENT)
+            and doc.read_quality is ReadQuality.OK
+            and doc.extracted_text.strip()
+        ),
+        key=lambda d: (0 if d.document_type is DocumentType.CONTRACT else 1, d.received_at, d.id),
+    )
+    if not contract_docs:
+        return
+
+    existing_rules = [
+        r for r in list_rules(conn, contract_id) if r.review_status is not ReviewStatus.REJECTED
+    ]
+    existing_rule_by_sig: dict[tuple[RuleType, str, date | None, Decimal | None], ContractRule] = {}
+    for r in existing_rules:
+        sig = (
+            r.rule_type,
+            normalize_item_key(r.item_name) if r.rule_type is RuleType.ITEM_PRICE else "",
+            r.validity.start,
+            r.value,
+        )
+        existing_rule_by_sig.setdefault(sig, r)
+    existing_rule_sigs: set[tuple[RuleType, str, date | None, Decimal | None]] = set(
+        existing_rule_by_sig
+    )
+    all_contract_amendments = list_amendments(conn)
+    existing_singleton_types = {
+        r.rule_type
+        for r in existing_rules
+        if r.rule_type
+        in (
+            RuleType.INSS_RETENTION,
+            RuleType.ISS_RETENTION,
+            RuleType.APPROVAL_LIMIT,
+            RuleType.PAYMENT_TERMS,
+            RuleType.ADJUSTMENT,
+        )
+    }
+    existing_invoices = list(list_invoices(conn, contract_id))
+    inv_by_number = {inv.number.strip().casefold(): inv for inv in existing_invoices}
+
+    for doc in contract_docs:
+        extracted = extract_dossier_artifacts(
+            doc.extracted_text,
+            contract_id=contract_id,
+            source_document_id=doc.id,
+        )
+        if doc.document_type is DocumentType.CONTRACT:
+            meta = extracted.contract_metadata
+            fallback_validity = (
+                _extract_contract_validity(doc.extracted_text)
+                if (meta.validity_start is None and meta.validity_end is None)
+                else ValidityPeriod()
+            )
+            contract_updates: dict[str, object] = {}
+            if contract.legal_nature is None and meta.legal_nature is not None:
+                contract_updates["legal_nature"] = meta.legal_nature
+            if contract.bank_code is None and meta.bank_code is not None:
+                contract_updates["bank_code"] = meta.bank_code
+            if contract.bank_agency is None and meta.bank_agency is not None:
+                contract_updates["bank_agency"] = meta.bank_agency
+            if contract.bank_account is None and meta.bank_account is not None:
+                contract_updates["bank_account"] = meta.bank_account
+            if contract.validity.start is None and contract.validity.end is None:
+                cand_start = meta.validity_start or fallback_validity.start
+                cand_end = meta.validity_end or fallback_validity.end
+                if cand_start is not None or cand_end is not None:
+                    if cand_start is not None and cand_end is not None and cand_start > cand_end:
+                        cand_start, cand_end = None, None
+                    if cand_start is not None or cand_end is not None:
+                        contract_updates["validity"] = ValidityPeriod(
+                            start=cand_start, end=cand_end
+                        )
+            if contract_updates:
+                contract = contract.model_copy(update=contract_updates)
+                save_contract(conn, contract)
+
+        for key, patch in extracted.invoice_patches.items():
+            inv = inv_by_number.get(key)
+            if inv is None:
+                continue
+            inv_updates: dict[str, object] = {}
+            if inv.attestation_date is None and patch.attestation_date is not None:
+                inv_updates["attestation_date"] = patch.attestation_date
+            if inv.inss_withheld is None and patch.inss_withheld is not None:
+                inv_updates["inss_withheld"] = patch.inss_withheld
+            if inv.iss_withheld is None and patch.iss_withheld is not None:
+                inv_updates["iss_withheld"] = patch.iss_withheld
+            if inv.net_total is None and patch.net_total is not None:
+                inv_updates["net_total"] = patch.net_total
+            if inv.service_description is None and patch.service_description is not None:
+                inv_updates["service_description"] = patch.service_description
+            if inv.supplier_legal_nature is None and patch.supplier_legal_nature is not None:
+                inv_updates["supplier_legal_nature"] = patch.supplier_legal_nature
+            if inv.raw_supplier_cnpj is None and patch.raw_supplier_cnpj is not None:
+                inv_updates["raw_supplier_cnpj"] = patch.raw_supplier_cnpj
+            if patch.supplier and patch.supplier != inv.supplier:
+                # Preserva razão social divergente real da nota (ex.: Eireli na NF 1044).
+                inv_updates["supplier"] = patch.supplier
+            if inv_updates:
+                updated_inv = inv.model_copy(update=inv_updates)
+                save_invoice(conn, updated_inv)
+                inv_by_number[key] = updated_inv
+
+        if extracted.expected_glosas_by_period:
+            for key, inv in list(inv_by_number.items()):
+                expected_glosa = extracted.expected_glosas_by_period.get(str(inv.reference_period))
+                if expected_glosa is not None and inv.expected_glosa is None:
+                    updated_inv = inv.model_copy(update={"expected_glosa": expected_glosa})
+                    save_invoice(conn, updated_inv)
+                    inv_by_number[key] = updated_inv
+
+        for op in extracted.payment_orders:
+            matched_inv = inv_by_number.get(op.invoice_number.strip().casefold())
+            linked_op = (
+                op.model_copy(update={"invoice_id": matched_inv.id})
+                if matched_inv is not None and op.invoice_id is None
+                else op
+            )
+            save_payment_order(conn, linked_op)
+
+        for cert in extracted.tax_certificates:
+            save_tax_certificate(conn, cert)
+
+        if extracted.financial_summary is not None:
+            save_financial_summary(conn, extracted.financial_summary)
+
+        if has_supplemental_contract_rules(doc.extracted_text) or has_structured_financial_sections(
+            doc.extracted_text
+        ):
+            newly_saved_supp: list[ContractRule] = []
+            for supp_rule in extracted.supplemental_rules:
+                supp_key = (
+                    supp_rule.rule_type,
+                    normalize_item_key(supp_rule.item_name)
+                    if supp_rule.rule_type is RuleType.ITEM_PRICE
+                    else "",
+                    supp_rule.validity.start,
+                    supp_rule.value,
+                )
+                if supp_rule.rule_type in existing_singleton_types:
+                    continue
+                if supp_key in existing_rule_sigs:
+                    existing_r = existing_rule_by_sig.get(supp_key)
+                    if (
+                        existing_r is not None
+                        and supp_rule.rule_type is RuleType.ITEM_PRICE
+                        and supp_rule.quantity is not None
+                        and existing_r.quantity != supp_rule.quantity
+                    ):
+                        revs = list_reviews(
+                            conn,
+                            target_type=ReviewTargetType.RULE,
+                            target_id=existing_r.id,
+                        )
+                        human_locked = existing_r.review_status.is_trusted and any(
+                            rv.user != AUTO_APPROVE_USER for rv in revs
+                        )
+                        if not human_locked:
+                            reconciled = existing_r.model_copy(
+                                update={
+                                    "quantity": supp_rule.quantity,
+                                    "unit": existing_r.unit or supp_rule.unit,
+                                    "quantity_scope": (
+                                        existing_r.quantity_scope or supp_rule.quantity_scope
+                                    ),
+                                }
+                            )
+                            save_rule(conn, reconciled)
+                            existing_rule_by_sig[supp_key] = reconciled
+                            for am in all_contract_amendments:
+                                if am.new_rule is not None and am.new_rule.id == reconciled.id:
+                                    save_amendment(
+                                        conn,
+                                        am.model_copy(update={"new_rule": reconciled}),
+                                    )
+                    continue
+                # Se for regra base sem start explícito nas cláusulas, herda start do contrato.
+                effective_supp = supp_rule
+                if (
+                    doc.document_type is DocumentType.CONTRACT
+                    and supp_rule.validity.start is None
+                    and contract.validity.start is not None
+                ):
+                    effective_supp = supp_rule.model_copy(
+                        update={
+                            "validity": ValidityPeriod(
+                                start=contract.validity.start,
+                                end=supp_rule.validity.end or contract.validity.end,
+                            )
+                        }
+                    )
+                save_rule(conn, effective_supp)
+                existing_rule_sigs.add(supp_key)
+                if effective_supp.rule_type in (
+                    RuleType.INSS_RETENTION,
+                    RuleType.ISS_RETENTION,
+                    RuleType.APPROVAL_LIMIT,
+                    RuleType.PAYMENT_TERMS,
+                    RuleType.ADJUSTMENT,
+                ):
+                    existing_singleton_types.add(effective_supp.rule_type)
+                newly_saved_supp.append(effective_supp)
+
+            if auto_approve_above_threshold and newly_saved_supp:
+                approved_supp, _ = _auto_approve_high_confidence_rules(
+                    conn,
+                    newly_saved_supp,
+                    reviewed_at=datetime.now(UTC),
+                )
+            else:
+                approved_supp = tuple(newly_saved_supp)
+
+            if doc.document_type is DocumentType.AMENDMENT and approved_supp:
+                _auto_link_extracted_amendments(conn, contract_id, doc, approved_supp)
+
+        if (
+            auto_approve_above_threshold
+            and doc.document_type is DocumentType.AMENDMENT
+            and not doc.reviewed
+        ):
+            doc_rules = [
+                r
+                for r in list_rules(conn, contract_id)
+                if r.evidence.source_document_id == doc.id
+                and r.review_status is not ReviewStatus.REJECTED
+            ]
+            if doc_rules and all(r.review_status.is_trusted for r in doc_rules):
+                mark_amendment_reviewed(
+                    conn,
+                    doc.id,
+                    user=AUTO_APPROVE_USER,
+                    justification=(
+                        "Aditivo revisado automaticamente: todas as regras extraídas têm "
+                        "confiança superior a 85%."
+                    ),
+                    reviewed_at=datetime.now(UTC),
+                )
+
+
+def fetch_payment_cycle_audit(
+    conn: sqlite3.Connection, contract_id: str | None = None
+) -> PaymentCycleAuditResult:
+    """Sincroniza e executa a auditoria determinística de OPs, certidões e resumos."""
+    if contract_id is not None:
+        sync_contract_dossier_data(conn, contract_id)
+        contract = get_contract(conn, contract_id)
+        if contract is None:
+            return PaymentCycleAuditResult()
+        all_rules = list_rules(conn, contract_id)
+        active_rules = tuple(r for r in all_rules if r.review_status is not ReviewStatus.REJECTED)
+        return audit_payment_cycle(
+            contract,
+            rules=active_rules,
+            invoices=list_invoices(conn, contract_id),
+            payment_orders=list_payment_orders(conn, contract_id),
+            certificates=list_tax_certificates(conn, contract_id),
+            financial_summaries=list_financial_summaries(conn, contract_id),
+        )
+
+    contracts = list_contracts(conn)
+    if not contracts:
+        return PaymentCycleAuditResult()
+
+    all_findings: list[PaymentFinding] = []
+    merged_checks: dict[str, tuple[Check, ...]] = {}
+    merged_dup_pairs: dict[str, tuple[str, ...]] = {}
+    total_ops = 0
+    total_certs = 0
+    total_net = Decimal("0.00")
+
+    for contract in contracts:
+        part = fetch_payment_cycle_audit(conn, contract.id)
+        total_ops += part.payment_orders_count
+        total_certs += part.certificates_count
+        total_net += part.total_net_paid
+        all_findings.extend(part.findings)
+        merged_checks.update(part.checks_by_invoice_number)
+        merged_dup_pairs.update(part.duplicate_op_pairs)
+
+    return PaymentCycleAuditResult(
+        payment_orders_count=total_ops,
+        certificates_count=total_certs,
+        total_net_paid=total_net,
+        checks_by_invoice_number=merged_checks,
+        findings=tuple(all_findings),
+        duplicate_op_pairs=merged_dup_pairs,
+    )
+
+
 def process_contract_document(
     conn: sqlite3.Connection,
     *,
@@ -286,8 +680,9 @@ def process_contract_document(
     document_type: DocumentType = DocumentType.CONTRACT,
     received_at: datetime | None = None,
     confidence_threshold: Decimal = DEFAULT_CONFIDENCE_THRESHOLD,
+    auto_approve_above_threshold: bool = False,
 ) -> DocumentProcessingResult:
-    """Lê PDF ou DOCX de contrato/aditivo, grava SHA-256, extrai e persiste regras pendentes."""
+    """Lê PDF ou DOCX de contrato/aditivo, grava SHA-256, extrai e persiste regras."""
     if get_contract(conn, contract_id) is None:
         raise ValueError(f"contrato {contract_id} não encontrado")
     if document_type not in (DocumentType.CONTRACT, DocumentType.AMENDMENT):
@@ -303,6 +698,11 @@ def process_contract_document(
 
     if suffix == ".pdf":
         pdf_result = read_pdf(content)
+        if pdf_result.read_quality is ReadQuality.NO_TEXT:
+            raw_pdf = content.read_bytes() if isinstance(content, Path) else content
+            ocr_parsed = _try_ocr_pdf_with_client(file_name, raw_pdf, client)
+            if ocr_parsed is not None and ocr_parsed.pdf_result is not None:
+                pdf_result = ocr_parsed.pdf_result
         read_warning = pdf_result.warning
         read_quality = pdf_result.read_quality
         extracted_text = pdf_result.full_text
@@ -352,13 +752,41 @@ def process_contract_document(
         confidence_threshold=confidence_threshold,
         extracted_at=timestamp,
     )
-    for rule in jurista_result.rules:
+    final_rules = jurista_result.rules
+    extra_warnings: list[str] = []
+    for rule in final_rules:
         save_rule(conn, rule)
 
-    warnings = _unique_messages((read_warning,), jurista_result.warnings)
+    if auto_approve_above_threshold and final_rules:
+        final_rules, auto_count = _auto_approve_high_confidence_rules(
+            conn,
+            final_rules,
+            reviewed_at=timestamp,
+        )
+        if auto_count > 0:
+            extra_warnings.append(
+                f"{auto_count} regra(s) aprovada(s) automaticamente (confiança > 85%); "
+                "caso queira alterar, use Corrigir ou Rejeitar em Regras e Vigência."
+            )
+        if is_amendment and all(
+            rule.review_status is ReviewStatus.CONFIRMED for rule in final_rules
+        ):
+            doc_rev = mark_amendment_reviewed(
+                conn,
+                document.id,
+                user=AUTO_APPROVE_USER,
+                justification=(
+                    "Aditivo revisado automaticamente: todas as regras extraídas têm "
+                    "confiança superior a 85%."
+                ),
+                reviewed_at=timestamp,
+            )
+            document = doc_rev.document
+
+    warnings = _unique_messages((read_warning,), jurista_result.warnings, extra_warnings)
     return DocumentProcessingResult(
         document=document,
-        rules=jurista_result.rules,
+        rules=final_rules,
         anchoring_results=jurista_result.anchoring_results,
         warnings=warnings,
         schema_valid=jurista_result.schema_valid,
@@ -453,15 +881,49 @@ def mark_amendment_reviewed(
     )
 
 
+def _contract_id_keys(raw_id: str | None) -> set[str]:
+    """Gera chaves normalizadas para casar Ata 007/2025 <-> ARP-007/2025 <-> 007/2025."""
+    if not raw_id:
+        return set()
+    cleaned = raw_id.strip().upper()
+    keys = {cleaned}
+    stripped = re.sub(
+        r"^(?:ATA\s+DE\s+REGISTRO\s+DE\s+PRE[ÇC]OS|ATA|ARP|CONTRATO(?:\s+DE\s+LOCA[ÇC][ÃA]O)?|"
+        r"TERMO\s+DE\s+CONTRATO|LOC)[-\s#:Nº°.]*",
+        "",
+        cleaned,
+    ).strip(" -.:#")
+    if stripped:
+        keys.add(stripped)
+        num_year = re.search(r"([A-Z]*-?\d+/\d{4})$", stripped)
+        if num_year:
+            keys.add(num_year.group(1))
+    return keys
+
+
+def _match_contract_by_id_or_hint(
+    contracts: Sequence[Contract], raw_id: str | None
+) -> Contract | None:
+    if not raw_id:
+        return None
+    exact = next((item for item in contracts if item.id == raw_id), None)
+    if exact is not None:
+        return exact
+    target_keys = _contract_id_keys(raw_id)
+    matches = [item for item in contracts if _contract_id_keys(item.id) & target_keys]
+    return matches[0] if len(matches) == 1 else None
+
+
 def resolve_contract_link(
     contracts: Sequence[Contract], invoice: Invoice
 ) -> tuple[str | None, str | None]:
     """
-    Resolve o vínculo da cobrança ao contrato por nº informado ou CNPJ único cadastrado.
+    Resolve o vínculo da cobrança ao contrato por nº informado, referência na descrição
+    (ex.: Ata de Registro de Preços nº 007/2025 / Contrato nº ...) ou CNPJ único cadastrado.
     Em CNPJ ambíguo (> 1 contrato) ou ausente, mantém sem vínculo com aviso explícito.
     """
     if invoice.contract_id is not None:
-        matched = next((item for item in contracts if item.id == invoice.contract_id), None)
+        matched = _match_contract_by_id_or_hint(contracts, invoice.contract_id)
         if matched is None:
             return (
                 None,
@@ -474,6 +936,18 @@ def resolve_contract_link(
                 f"CNPJ da cobrança {invoice.number} diverge do contrato {matched.id}.",
             )
         return matched.id, None
+
+    if invoice.service_description:
+        desc_hint = _extract_contract_id_hint(invoice.service_description, "")
+        if desc_hint is not None:
+            matched_desc = _match_contract_by_id_or_hint(contracts, desc_hint)
+            if matched_desc is not None:
+                if matched_desc.supplier_cnpj != invoice.supplier_cnpj:
+                    return (
+                        matched_desc.id,
+                        f"CNPJ da cobrança {invoice.number} diverge do contrato {matched_desc.id}.",
+                    )
+                return matched_desc.id, None
 
     matching_cnpj = [item for item in contracts if item.supplier_cnpj == invoice.supplier_cnpj]
     if len(matching_cnpj) == 1:
@@ -561,6 +1035,11 @@ def import_billing_document(
         docx_result: DocxReadResult | None = None
         if suffix == ".pdf":
             pdf_result = read_pdf(content)
+            if pdf_result.read_quality is ReadQuality.NO_TEXT:
+                raw_pdf = content.read_bytes() if isinstance(content, Path) else content
+                ocr_parsed = _try_ocr_pdf_with_client(file_name, raw_pdf, client)
+                if ocr_parsed is not None and ocr_parsed.pdf_result is not None:
+                    pdf_result = ocr_parsed.pdf_result
             read_warning = pdf_result.warning
             read_quality = pdf_result.read_quality
             extracted_text = pdf_result.full_text
@@ -680,6 +1159,12 @@ def audit_stored_invoice(
     invoice = get_invoice(conn, invoice_id)
     if invoice is None:
         raise ValueError(f"cobrança {invoice_id} não encontrada")
+
+    if invoice.contract_id is not None:
+        sync_contract_dossier_data(conn, invoice.contract_id)
+        refreshed_invoice = get_invoice(conn, invoice_id)
+        if refreshed_invoice is not None:
+            invoice = refreshed_invoice
 
     contract: Contract | None = None
     base_rules: tuple[ContractRule, ...] = ()
@@ -1179,8 +1664,13 @@ def seed_synthetic_demo(
 
 
 _CONTRACT_CT_RE = re.compile(r"\b(CT[-_]\d{4}[-_]\d{2,})\b", re.IGNORECASE)
+_ATA_EXPLICIT_NUM_RE = re.compile(
+    r"(?i)\b(?:ata\s+de\s+registro\s+de\s+pre[çc]os|arp|ata)\s*"
+    r"(?:n[º°.]?|n[úu]mero|#)\s*([A-Z0-9][A-Z0-9./_-]{2,})"
+)
 _CONTRACT_EXPLICIT_NUM_RE = re.compile(
-    r"(?i)\b(?:contrato|instrumento)(?:\s+particular)?\s+"
+    r"(?i)\b(?:contrato(?:\s+de\s+loca[çc][ãa]o(?:\s+n[ãa]o\s+residencial)?)?|"
+    r"termo\s+de\s+contrato|instrumento(?:\s+particular)?)\s+"
     r"(?:n[º°.]?|n[úu]mero|#)\s*([A-Z0-9][A-Z0-9./_-]{2,})"
 )
 _CONTRACT_CODE_RE = re.compile(r"(?i)\bcontrato\s+([A-Z]{1,6}[-_/][0-9][A-Z0-9./_-]*)")
@@ -1189,12 +1679,74 @@ _CNPJ_ANY_TOKEN_RE = re.compile(
     r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?[0-9?X*]{2}(?![0-9A-Za-z?X*])",
     re.IGNORECASE,
 )
-_SUPPLIER_CNPJ_RE = re.compile(
-    r"(?i)(?:contratad[ao]|fornecedor|prestador(?:a)?(?:\s+de\s+servi[çc]os)?)"
-    r"[^\n]{0,80}?(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?[0-9?X*]{2}(?![0-9A-Za-z?X*]))"
+_PREAMBLE_ROLE_END_RE = re.compile(
+    r"(?is)doravante\s+(?:denominad[ao]\s+)?(?P<role>"
+    r"CONTRATANTE|[ÓO]RG[ÃA]O\s+GERENCIADOR|LOCAT[ÁA]RI[AO]|TOMADOR(?:A)?|"
+    r"CONCEDENTE|COMPRADOR(?:A)?|"
+    r"CONTRATAD[AO]|DETENTOR(?:A)?|LOCADOR(?:A)?|"
+    r"PRESTADOR(?:A)?(?:\s+DE\s+SERVI[ÇC]OS)?|FORNECEDOR(?:A)?|"
+    r"CREDENCIAD[AO]|BENEFICI[ÁA]RI[AO])\b"
 )
-_COMPANY_LINE_RE = re.compile(r"(?im)^\s*contratante\s*[:\-]\s*(.+?)\.?\s*$")
-_SUPPLIER_LINE_RE = re.compile(r"(?im)^\s*contratad[ao]\s*[:\-]\s*(.+?)\s*$")
+_SUPPLIER_ROLES = frozenset(
+    {
+        "CONTRATADA",
+        "CONTRATADO",
+        "DETENTORA",
+        "DETENTOR",
+        "LOCADORA",
+        "LOCADOR",
+        "PRESTADORA",
+        "PRESTADOR",
+        "PRESTADORA DE SERVICOS",
+        "PRESTADOR DE SERVICOS",
+        "FORNECEDORA",
+        "FORNECEDOR",
+        "CREDENCIADA",
+        "CREDENCIADO",
+        "BENEFICIARIA",
+        "BENEFICIARIO",
+    }
+)
+_SUPPLIER_CNPJ_RE = re.compile(
+    r"(?is)(?:contratad[ao]|detentor[ao]?|locador[ao]?|fornecedor[ao]?|"
+    r"prestador(?:a)?(?:\s+de\s+servi[çc]os)?)"
+    r"(?:(?!\b(?:contratante|org[ãa]o\s+gerenciador|locat[áa]ri[ao]|tomador|cl[aá]usula)\b)[\s\S]){0,300}?"
+    r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?[0-9?X*]{2}(?![0-9A-Za-z?X*]))"
+)
+_CONTRATANTE_WORD_RE = re.compile(
+    r"(?i)\b(?:contratante|[óo]rg[ãa]o\s+gerenciador|locat[áa]ri[ao]|tomador(?:a)?)\b"
+)
+_CONTRATADA_WORD_RE = re.compile(
+    r"(?i)\b(?:contratad[ao]|detentor[ao]?|locador[ao]?|fornecedor[ao]?|"
+    r"prestador(?:a)?(?:\s+de\s+servi[çc]os)?)\b"
+)
+_INSURANCE_CONTEXT_RE = re.compile(r"(?i)\b(?:ap[óo]lice|seguro|garantia|certid[ãa]o)\b")
+_VALIDITY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?is)CL[ÁA]USULA\s+(?:\d+[ªa.º°]?|PRIMEIRA|SEGUNDA|TERCEIRA|QUARTA|QUINTA|"
+        r"SEXTA|S[ÉE]TIMA|OITAVA|NONA|D[ÉE]CIMA)[^\n]*(?:PRAZO|VIG[ÊE]NCIA)[\s\S]{0,260}?"
+        r"(\d{2}/\d{2}/\d{4})\s*(?:a|at[ée]|[-–])\s*(\d{2}/\d{2}/\d{4})"
+    ),
+    re.compile(
+        r"(?i)(?:o\s+contrato|a\s+loca[çc][ãa]o|a\s+ata|o\s+instrumento)\s+"
+        r"(?:ter[áa]\s+vig[êe]ncia|vigorar[áa])[^.\n]{0,140}?(?:de\s+)?"
+        r"(\d{2}/\d{2}/\d{4})\s*(?:a|at[ée]|[-–])\s*(\d{2}/\d{2}/\d{4})"
+    ),
+    re.compile(
+        r"(?i)vigorar[áa][^.\n]{0,120}?(?:de\s+)?"
+        r"(\d{2}/\d{2}/\d{4})\s*(?:a|at[ée]|[-–])\s*(\d{2}/\d{2}/\d{4})"
+    ),
+    re.compile(
+        r"(?i)vig[êe]ncia[^.\n]{0,120}?(?:de\s+|in[íi]cio\s+em\s+)?"
+        r"(\d{2}/\d{2}/\d{4})\s*(?:a|at[ée]|[-–]|e\s+t[ée]rmino\s+em)\s*(\d{2}/\d{2}/\d{4})"
+    ),
+)
+_COMPANY_LINE_RE = re.compile(
+    r"(?im)^\s*(?:contratante|[óo]rg[ãa]o\s+gerenciador|locat[áa]ri[ao])\s*[:\-]\s*(.+?)\.?\s*$"
+)
+_SUPPLIER_LINE_RE = re.compile(
+    r"(?im)^\s*(?:contratad[ao]|detentor[ao]?|locador[ao]?|fornecedor)\s*[:\-]\s*(.+?)\s*$"
+)
 _CONTRACT_CLAUSE_RE = re.compile(r"(?i)\bcl[aá]usula\b")
 _STRUCTURED_INVOICE_RE = re.compile(
     r"(?:nota\s+fiscal|fatura(?:\s+de\s+servi[çc]os)?|nf-?e|nfs-?e|cobran[çc]a)"
@@ -1243,6 +1795,91 @@ def _read_contract_bytes(file_name: str, raw_bytes: bytes) -> _ParsedContractUpl
     )
 
 
+def _try_ocr_pdf_with_client(
+    file_name: str,
+    raw_bytes: bytes,
+    client: LLMClient | None,
+) -> _ParsedContractUpload | None:
+    if client is None or Path(file_name).suffix.casefold() != ".pdf":
+        return None
+    transcribe_fn = getattr(client, "transcribe_pdf", None)
+    if not callable(transcribe_fn):
+        return None
+    try:
+        raw_pages = transcribe_fn(raw_bytes)
+    except (LLMExecutionError, OSError, ValueError, RuntimeError):
+        return None
+    if not raw_pages:
+        return None
+    pages = tuple(
+        PdfPage(page_number=int(page_num), text=str(page_text).strip())
+        for page_num, page_text in raw_pages
+        if str(page_text).strip()
+    )
+    non_ws = sum(len("".join(p.text.split())) for p in pages)
+    if not pages or non_ws < DEFAULT_MIN_TEXT_CHARS:
+        return None
+    full_text = "\n\n".join(p.text for p in pages)
+    pdf_res = PdfReadResult(
+        pages=pages,
+        read_quality=ReadQuality.OK,
+        full_text=full_text,
+        warning=f"Texto de '{file_name}' extraído por leitura multimodal (PDF digitalizado).",
+    )
+    return _ParsedContractUpload(
+        read_quality=ReadQuality.OK,
+        full_text=full_text,
+        read_warning=pdf_res.warning,
+        pdf_result=pdf_res,
+    )
+
+
+def _classify_from_parsed(
+    file_name: str,
+    parsed: _ParsedContractUpload,
+    mode: UploadClassificationMode,
+) -> _DetectedUploadKind:
+    if mode != "AUTO":
+        return mode
+
+    lowered = file_name.casefold()
+    text = parsed.full_text
+    has_clauses = bool(_CONTRACT_CLAUSE_RE.search(text))
+    has_invoice_marker = bool(_STRUCTURED_INVOICE_RE.search(text))
+    has_billing_filename = any(
+        token in lowered
+        for token in (
+            "fatura",
+            "nota_fiscal",
+            "nf-e",
+            "nfe",
+            "nfse",
+            "boleto",
+            "cobranca",
+            "cobrança",
+        )
+    )
+
+    if "aditivo" in lowered:
+        return "AMENDMENT"
+    if "dossie" in lowered or "dossiê" in lowered:
+        return "DOSSIER"
+    if has_billing_filename:
+        return "DOSSIER" if has_clauses else "BILLING"
+    if has_clauses and has_invoice_marker:
+        return "DOSSIER"
+    if has_invoice_marker:
+        return "BILLING"
+    header_slice = text.lstrip()[:350]
+    if (
+        header_slice
+        and not header_slice.casefold().startswith("contrato ")
+        and _AMENDMENT_HEADING_RE.search(header_slice)
+    ):
+        return "AMENDMENT"
+    return "CONTRACT"
+
+
 def _classify_uploaded_file_with_content(
     file_name: str,
     raw_bytes: bytes,
@@ -1267,45 +1904,7 @@ def _classify_uploaded_file_with_content(
             read_warning=f"Falha ao ler texto de '{file_name}'.",
         )
 
-    if mode != "AUTO":
-        return mode, parsed, None
-
-    lowered = file_name.casefold()
-    text = parsed.full_text
-    has_clauses = bool(_CONTRACT_CLAUSE_RE.search(text))
-    has_invoice_marker = bool(_STRUCTURED_INVOICE_RE.search(text))
-    has_billing_filename = any(
-        token in lowered
-        for token in (
-            "fatura",
-            "nota_fiscal",
-            "nf-e",
-            "nfe",
-            "nfse",
-            "boleto",
-            "cobranca",
-            "cobrança",
-        )
-    )
-
-    if "aditivo" in lowered:
-        return "AMENDMENT", parsed, None
-    if "dossie" in lowered or "dossiê" in lowered:
-        return "DOSSIER", parsed, None
-    if has_billing_filename:
-        return ("DOSSIER" if has_clauses else "BILLING"), parsed, None
-    if has_clauses and has_invoice_marker:
-        return "DOSSIER", parsed, None
-    if has_invoice_marker:
-        return "BILLING", parsed, None
-    header_slice = text.lstrip()[:350]
-    if (
-        header_slice
-        and not header_slice.casefold().startswith("contrato ")
-        and _AMENDMENT_HEADING_RE.search(header_slice)
-    ):
-        return "AMENDMENT", parsed, None
-    return "CONTRACT", parsed, None
+    return _classify_from_parsed(file_name, parsed, mode), parsed, None
 
 
 def _extract_contract_id_hint(text: str, file_name: str) -> str | None:
@@ -1313,6 +1912,11 @@ def _extract_contract_id_hint(text: str, file_name: str) -> str | None:
         match_ct = _CONTRACT_CT_RE.search(source)
         if match_ct is not None:
             return match_ct.group(1).replace("_", "-").upper()
+    for match_ata in _ATA_EXPLICIT_NUM_RE.finditer(text):
+        candidate = match_ata.group(1).strip(" .,:;")
+        if any(char.isdigit() for char in candidate) and ("/" in candidate or "-" in candidate):
+            upper = candidate.upper()
+            return upper if upper.startswith(("ARP-", "ATA-")) else f"ARP-{upper}"
     for match_num in _CONTRACT_EXPLICIT_NUM_RE.finditer(text):
         candidate = match_num.group(1).strip(" .,:;")
         if any(char.isdigit() for char in candidate) and (
@@ -1326,29 +1930,198 @@ def _extract_contract_id_hint(text: str, file_name: str) -> str | None:
     return None
 
 
+def _extract_contract_validity(text: str) -> ValidityPeriod:
+    """Extrai início e fim explícitos de vigência contratual em texto PT-BR, sem inventar datas."""
+    for idx, pattern in enumerate(_VALIDITY_PATTERNS):
+        for match in pattern.finditer(text):
+            if idx == len(_VALIDITY_PATTERNS) - 1:
+                prefix = text[max(0, match.start() - 80) : match.start()]
+                if _INSURANCE_CONTEXT_RE.search(prefix) is not None:
+                    continue
+            try:
+                start_dt = datetime.strptime(match.group(1), "%d/%m/%Y").date()
+                end_dt = datetime.strptime(match.group(2), "%d/%m/%Y").date()
+            except ValueError:
+                continue
+            if start_dt <= end_dt:
+                return ValidityPeriod(start=start_dt, end=end_dt)
+    return ValidityPeriod()
+
+
+class _ContractPartiesInfo(StrictModel):
+    company: str | None = None
+    client_cnpj: str | None = None
+    supplier: str | None = None
+    supplier_cnpj: str | None = None
+    invalid_supplier_cnpj: str | None = None
+
+
+def _normalize_role_token(role: str) -> str:
+    return (
+        " ".join(role.upper().split())
+        .replace("Ó", "O")
+        .replace("Ã", "A")
+        .replace("Á", "A")
+        .replace("Í", "I")
+        .replace("Ç", "C")
+    )
+
+
+def _clean_preamble_entity_name(raw_chunk: str) -> str | None:
+    # Mantém apenas o núcleo anterior à qualificação jurídica/CNPJ.
+    cut_m = re.search(
+        r"(?is),\s*(?:pessoa\s+jur[íi]dica|inscrit[ao]\s+no\s+CNPJ|com\s+sede|CPF\b)"
+        r"|\(\s*CNPJ\b",
+        raw_chunk,
+    )
+    prefix = raw_chunk[: cut_m.start()] if cut_m is not None else raw_chunk
+    # Em cabeçalhos de título seguidos de corpo do preâmbulo, preserva após a linha de título.
+    header_split = re.split(
+        r"(?is)^.*?(?:TERMO\s+DE\s+CONTRATO|CONTRATO\s+DE\s+LOCA[ÇC][ÃA]O|ATA\s+DE\s+REGISTRO"
+        r"|Processo(?:\s+Administrativo)?\s+n[º°.]?)[^\n]*\n+",
+        prefix,
+        maxsplit=1,
+    )
+    if len(header_split) == 2 and header_split[1].strip():
+        prefix = header_split[1]
+    # Remove locuções introdutórias antes da razão social.
+    interm_m = re.search(r"(?is)\bpor\s+interm[ée]dio\s+d[ao]\s+(.+)$", prefix)
+    if interm_m is not None and interm_m.group(1).strip():
+        prefix = interm_m.group(1)
+    prefix = re.sub(
+        r"(?is)^.*?(?:Pelo\s+presente\s+instrumento[^,]*,\s*)?de\s+(?:um|outro)\s+lado\b\s*,?\s*",
+        "",
+        prefix,
+    )
+    prefix = re.sub(
+        r"(?is)^.*?\bAos\s+[^,]+dias\s+do\s+m[êe]s\s+de\s+[^,]+,\s*",
+        "",
+        prefix,
+    )
+    prefix = re.sub(
+        r"(?is)^[\s;,.-]*(?:e\s+)?(?:,\s*de\s+outro\s+lado\s*,?\s*)?(?:a\s+empresa\s+|o\s+|a\s+)",
+        "",
+        prefix,
+    )
+    cleaned = " ".join(prefix.split()).strip(" ,-:;").lstrip(".")
+    return cleaned or None
+
+
+def _extract_contract_parties(text: str) -> _ContractPartiesInfo:
+    """Identifica contratante/órgão e fornecedor/contratada/detentora/locadora no preâmbulo."""
+    clause_cut = re.search(r"(?im)^\s*CL[ÁA]USULA\s+(?:1[ªa.]|PRIMEIRA)\b", text)
+    preamble = text[: clause_cut.start()] if clause_cut is not None else text[:4000]
+
+    company: str | None = None
+    client_cnpj: str | None = None
+    supplier: str | None = None
+    supplier_cnpj: str | None = None
+    invalid_supplier_cnpj: str | None = None
+
+    prev_end = 0
+    for role_m in _PREAMBLE_ROLE_END_RE.finditer(preamble):
+        segment = preamble[prev_end : role_m.end()]
+        prev_end = role_m.end()
+        role_key = _normalize_role_token(role_m.group("role"))
+        cnpjs_in_seg = _CNPJ_ANY_TOKEN_RE.findall(segment)
+        if not cnpjs_in_seg:
+            lookahead = preamble[role_m.start() : min(len(preamble), role_m.end() + 120)]
+            cnpjs_in_seg = _CNPJ_ANY_TOKEN_RE.findall(lookahead)
+        token = cnpjs_in_seg[-1] if cnpjs_in_seg else None
+        name = _clean_preamble_entity_name(segment)
+        if role_key in _SUPPLIER_ROLES:
+            if supplier is None and name:
+                supplier = name
+            if token is not None:
+                if is_valid_cnpj(token):
+                    supplier_cnpj = normalize_cnpj(token)
+                elif supplier_cnpj is None:
+                    invalid_supplier_cnpj = token
+        else:
+            if company is None and name:
+                company = name
+            if token is not None and is_valid_cnpj(token) and client_cnpj is None:
+                client_cnpj = normalize_cnpj(token)
+
+    # Suporte complementar a linhas "CONTRATANTE:" / "LOCADORA:" / "DETENTORA:"
+    if company is None:
+        company_match = _COMPANY_LINE_RE.search(text)
+        if company_match is not None and company_match.group(1).strip():
+            company = _clean_party_name(company_match.group(1)) or company_match.group(1).strip()
+    if supplier is None:
+        supplier_match = _SUPPLIER_LINE_RE.search(text)
+        if supplier_match is not None:
+            cleaned = _clean_party_name(supplier_match.group(1))
+            if cleaned:
+                supplier = cleaned
+
+    return _ContractPartiesInfo(
+        company=company,
+        client_cnpj=client_cnpj,
+        supplier=supplier,
+        supplier_cnpj=supplier_cnpj,
+        invalid_supplier_cnpj=invalid_supplier_cnpj,
+    )
+
+
 def _extract_supplier_cnpj_info(text: str) -> tuple[str | None, str | None]:
-    """Identifica o CNPJ da contratada/fornecedor sem confundir com o da contratante."""
-    head = text[:2500]
-    has_both_parties = bool(
-        re.search(r"(?i)\bcontratante\b", head) and re.search(r"(?i)\bcontratad[ao]\b", head)
+    """Identifica o CNPJ da contratada/fornecedor sem nunca confundir com o da contratante."""
+    parties = _extract_contract_parties(text)
+    if parties.supplier_cnpj is not None:
+        return parties.supplier_cnpj, None
+    if parties.invalid_supplier_cnpj is not None:
+        return None, parties.invalid_supplier_cnpj
+
+    head = text[:3000]
+    m_client = _CONTRATANTE_WORD_RE.search(head)
+    m_supplier = _CONTRATADA_WORD_RE.search(head)
+    has_side_by_side = (
+        m_client is not None
+        and m_supplier is not None
+        and abs(m_supplier.start() - m_client.start()) <= 30
     )
     head_tokens = _CNPJ_ANY_TOKEN_RE.findall(head)
-    if has_both_parties and len(head_tokens) >= 2:
-        supplier_token = head_tokens[1]
+    if (
+        has_side_by_side
+        and len(head_tokens) >= 2
+        and m_client is not None
+        and m_supplier is not None
+    ):
+        supplier_token = head_tokens[1] if m_client.start() < m_supplier.start() else head_tokens[0]
         if is_valid_cnpj(supplier_token):
             return normalize_cnpj(supplier_token), None
         return None, supplier_token
 
     for match_sup in _SUPPLIER_CNPJ_RE.finditer(text):
         token = match_sup.group(1)
+        if (
+            parties.client_cnpj
+            and is_valid_cnpj(token)
+            and normalize_cnpj(token) == parties.client_cnpj
+        ):
+            continue
         if is_valid_cnpj(token):
             return normalize_cnpj(token), None
         return None, token
 
+    if m_client is not None and m_supplier is not None and len(head_tokens) >= 2:
+        supplier_token = head_tokens[1] if m_client.start() < m_supplier.start() else head_tokens[0]
+        if not (
+            parties.client_cnpj
+            and is_valid_cnpj(supplier_token)
+            and normalize_cnpj(supplier_token) == parties.client_cnpj
+        ):
+            if is_valid_cnpj(supplier_token):
+                return normalize_cnpj(supplier_token), None
+            return None, supplier_token
+
     for match in _CNPJ_CANDIDATE_RE.finditer(text):
         candidate = match.group(0)
         if is_valid_cnpj(candidate):
-            return normalize_cnpj(candidate), None
+            norm = normalize_cnpj(candidate)
+            if parties.client_cnpj and norm == parties.client_cnpj:
+                continue
+            return norm, None
     return None, None
 
 
@@ -1386,6 +2159,9 @@ def _unique_auto_contract_id(
 
 
 def _extract_party_names(text: str) -> tuple[str | None, str | None]:
+    parties = _extract_contract_parties(text)
+    if parties.company is not None or parties.supplier is not None:
+        return parties.company, parties.supplier
     company_match = _COMPANY_LINE_RE.search(text)
     supplier_match = _SUPPLIER_LINE_RE.search(text)
     company_name = (
@@ -1476,23 +2252,33 @@ def _maybe_upgrade_provisional_contract(
     detected_cnpj: str | None,
     company_name: str | None,
     supplier_name: str | None,
+    detected_validity: ValidityPeriod | None = None,
     batch_warnings: list[str],
 ) -> None:
-    if contract.supplier_cnpj != _PROVISIONAL_CNPJ:
+    updates: dict[str, object] = {}
+    if (
+        contract.supplier_cnpj == _PROVISIONAL_CNPJ
+        and detected_cnpj is not None
+        and detected_cnpj != _PROVISIONAL_CNPJ
+    ):
+        updates["supplier_cnpj"] = detected_cnpj
+        updates["company"] = company_name or contract.company
+        updates["supplier"] = supplier_name or contract.supplier
+    if (
+        detected_validity is not None
+        and contract.validity.start is None
+        and contract.validity.end is None
+        and (detected_validity.start is not None or detected_validity.end is not None)
+    ):
+        updates["validity"] = detected_validity
+    if not updates:
         return
-    if detected_cnpj is None or detected_cnpj == _PROVISIONAL_CNPJ:
-        return
-    upgraded = contract.model_copy(
-        update={
-            "supplier_cnpj": detected_cnpj,
-            "company": company_name or contract.company,
-            "supplier": supplier_name or contract.supplier,
-        }
-    )
+    upgraded = contract.model_copy(update=updates)
     register_contract(conn, upgraded)
-    batch_warnings.append(
-        f"Contrato {upgraded.id} atualizado com o CNPJ real {upgraded.supplier_cnpj}."
-    )
+    if "supplier_cnpj" in updates:
+        batch_warnings.append(
+            f"Contrato {upgraded.id} atualizado com o CNPJ real {upgraded.supplier_cnpj}."
+        )
 
 
 def _resolve_contract_for_file(
@@ -1511,6 +2297,7 @@ def _resolve_contract_for_file(
     file_cid = _extract_contract_id_hint(text, file_name)
     file_cnpj, invalid_supplier_cnpj = _extract_supplier_cnpj_info(text)
     file_company, file_supplier = _extract_party_names(text)
+    file_validity = _extract_contract_validity(text)
     hint = hints_by_id.get(file_cid) if file_cid is not None else None
     effective_cnpj = file_cnpj or (hint.cnpj if hint else None) or batch_unique_cnpj
     effective_company = file_company or (hint.company if hint else None)
@@ -1544,12 +2331,13 @@ def _resolve_contract_for_file(
                 detected_cnpj=effective_cnpj,
                 company_name=effective_company,
                 supplier_name=effective_supplier,
+                detected_validity=file_validity,
                 batch_warnings=batch_warnings,
             )
             return selected_contract_id
 
     if file_cid is not None:
-        existing_cid = get_contract(conn, file_cid)
+        existing_cid = _match_contract_by_id_or_hint(list_contracts(conn), file_cid)
         if existing_cid is not None:
             _maybe_upgrade_provisional_contract(
                 conn,
@@ -1557,6 +2345,7 @@ def _resolve_contract_for_file(
                 detected_cnpj=effective_cnpj,
                 company_name=effective_company,
                 supplier_name=effective_supplier,
+                detected_validity=file_validity,
                 batch_warnings=batch_warnings,
             )
             return existing_cid.id
@@ -1585,7 +2374,7 @@ def _resolve_contract_for_file(
         ),
         supplier_cnpj=chosen_cnpj,
         subject="Contrato cadastrado automaticamente a partir dos documentos enviados",
-        validity=ValidityPeriod(),
+        validity=file_validity,
         comparison_tolerance=Decimal("0.00"),
         status=ContractStatus.ACTIVE,
     )
@@ -1615,10 +2404,18 @@ def _auto_link_extracted_amendments(
         return
 
     if doc.document_type is DocumentType.CONTRACT:
-        by_type: dict[RuleType, list[ContractRule]] = {}
+        by_type: dict[tuple[RuleType, str], list[ContractRule]] = {}
         for rule in extracted_rules:
             if rule.validity.start is not None:
-                by_type.setdefault(rule.rule_type, []).append(rule)
+                key = (
+                    rule.rule_type,
+                    (
+                        normalize_item_key(rule.item_name)
+                        if rule.rule_type is RuleType.ITEM_PRICE
+                        else ""
+                    ),
+                )
+                by_type.setdefault(key, []).append(rule)
         for group in by_type.values():
             if len(group) < 2:
                 continue
@@ -1658,33 +2455,46 @@ def _auto_link_extracted_amendments(
     all_rules = list_rules(conn, contract_id)
     documents = list_documents(conn, contract_id)
     rejected_ids = {r.id for r in all_rules if r.review_status is ReviewStatus.REJECTED}
-    existing_amendments = tuple(
+    working_amendments = [
         item
         for item in _contract_amendments_for_context(list_amendments(conn), all_rules, documents)
         if item.affected_rule_id not in rejected_ids
         and (item.new_rule is None or item.new_rule.id not in rejected_ids)
-    )
+    ]
     already_linked_new_ids = {
-        item.new_rule.id for item in existing_amendments if item.new_rule is not None
+        item.new_rule.id for item in working_amendments if item.new_rule is not None
     }
     base_rules = tuple(
         rule
         for rule in all_rules
         if rule.id not in rejected_ids and rule.id not in already_linked_new_ids
     )
-    timeline_rules = apply_amendments(base_rules, existing_amendments).rules
+    timeline_rules = apply_amendments(base_rules, working_amendments).rules
 
-    for new_rule in extracted_rules:
+    ordered_extracted = sorted(
+        extracted_rules,
+        key=lambda r: (r.validity.start or date.min, r.id),
+    )
+    for new_rule in ordered_extracted:
         if new_rule.id in already_linked_new_ids or new_rule.validity.start is None:
             continue
         effective = new_rule.validity.start
         if new_rule.validity.end is not None and new_rule.validity.end < effective:
             continue
+        new_item_key = (
+            normalize_item_key(new_rule.item_name)
+            if new_rule.rule_type is RuleType.ITEM_PRICE
+            else ""
+        )
         candidates = [
             cand
             for cand in timeline_rules
-            if cand.evidence.source_document_id != doc.id
+            if cand.id != new_rule.id
             and cand.rule_type is new_rule.rule_type
+            and (
+                new_rule.rule_type is not RuleType.ITEM_PRICE
+                or normalize_item_key(cand.item_name) == new_item_key
+            )
             and cand.review_status is not ReviewStatus.REJECTED
             and cand.validity.start is not None
             and cand.validity.start < effective
@@ -1701,18 +2511,19 @@ def _auto_link_extracted_amendments(
             if new_rule.relation is RuleRelation.REVOKED
             else RuleRelation.ALTERED
         )
-        register_amendment(
-            conn,
-            Amendment(
-                id=f"amend-auto-{uuid4().hex[:10]}",
-                affected_rule_id=target.id,
-                new_rule=None if relation is RuleRelation.REVOKED else new_rule,
-                source_document_id=doc.id,
-                effective_date=effective,
-                relation=relation,
-            ),
+        created_amend = Amendment(
+            id=f"amend-auto-{uuid4().hex[:10]}",
+            affected_rule_id=target.id,
+            new_rule=None if relation is RuleRelation.REVOKED else new_rule,
+            source_document_id=doc.id,
+            effective_date=effective,
+            relation=relation,
         )
+        register_amendment(conn, created_amend)
+        working_amendments.append(created_amend)
         already_linked_new_ids.add(new_rule.id)
+        base_rules = tuple(r for r in base_rules if r.id not in already_linked_new_ids)
+        timeline_rules = apply_amendments(base_rules, working_amendments).rules
 
 
 def _store_contract_doc_without_ai(
@@ -1763,6 +2574,7 @@ def ingest_uploaded_files(
     selected_contract_id: str | None = None,
     client: LLMClient | None = None,
     received_at: datetime | None = None,
+    auto_approve_above_threshold: bool = True,
 ) -> BatchUploadResult:
     """Ingere múltiplos arquivos (.pdf, .docx, .xml, .csv, .xlsx) e audita automaticamente."""
     timestamp = received_at if received_at is not None else datetime.now(UTC)
@@ -1771,6 +2583,15 @@ def ingest_uploaded_files(
     ] = []
     for idx, (file_name, raw_bytes) in enumerate(files):
         kind, pre_parsed, warn = _classify_uploaded_file_with_content(file_name, raw_bytes, mode)
+        if (
+            pre_parsed is not None
+            and pre_parsed.read_quality is ReadQuality.NO_TEXT
+            and client is not None
+        ):
+            ocr_parsed = _try_ocr_pdf_with_client(file_name, raw_bytes, client)
+            if ocr_parsed is not None:
+                pre_parsed = ocr_parsed
+                kind = _classify_from_parsed(file_name, ocr_parsed, mode)
         classified.append((idx, file_name, raw_bytes, kind, pre_parsed, warn))
 
     if selected_contract_id is not None and get_contract(conn, selected_contract_id) is None:
@@ -1873,6 +2694,7 @@ def ingest_uploaded_files(
                         client=client,
                         document_type=doc_type,
                         received_at=timestamp,
+                        auto_approve_above_threshold=auto_approve_above_threshold,
                     )
                 except (OSError, ValueError, RuntimeError) as exc:
                     saved_doc = get_document(conn, doc_id)
@@ -1939,21 +2761,42 @@ def ingest_uploaded_files(
                         else:
                             warns.extend(fiscal_res.warnings)
                             dossier_saved_ids: list[str] = []
-                            for raw_inv in fiscal_res.invoices:
-                                existing_target = get_contract(conn, resolved_cid)
-                                if (
-                                    existing_target is not None
-                                    and existing_target.supplier_cnpj == _PROVISIONAL_CNPJ
-                                    and raw_inv.supplier_cnpj != _PROVISIONAL_CNPJ
-                                ):
-                                    _maybe_upgrade_provisional_contract(
-                                        conn,
-                                        existing_target,
-                                        detected_cnpj=raw_inv.supplier_cnpj,
-                                        company_name=None,
-                                        supplier_name=raw_inv.supplier,
-                                        batch_warnings=batch_warnings,
+                            existing_target = get_contract(conn, resolved_cid)
+                            if (
+                                existing_target is not None
+                                and existing_target.supplier_cnpj == _PROVISIONAL_CNPJ
+                            ):
+                                valid_counts = Counter(
+                                    raw_inv.supplier_cnpj
+                                    for raw_inv in fiscal_res.invoices
+                                    if raw_inv.supplier_cnpj != _PROVISIONAL_CNPJ
+                                    and is_valid_cnpj(raw_inv.supplier_cnpj)
+                                )
+                                if valid_counts:
+                                    top_cnpj, top_hits = valid_counts.most_common(1)[0]
+                                    min_majority = max(1, (len(fiscal_res.invoices) + 1) // 2)
+                                    is_unique_top = (
+                                        len(valid_counts) == 1
+                                        or top_hits > valid_counts.most_common(2)[1][1]
                                     )
+                                    if top_hits >= min_majority and is_unique_top:
+                                        rep_supplier = next(
+                                            (
+                                                raw_inv.supplier
+                                                for raw_inv in fiscal_res.invoices
+                                                if raw_inv.supplier_cnpj == top_cnpj
+                                            ),
+                                            None,
+                                        )
+                                        _maybe_upgrade_provisional_contract(
+                                            conn,
+                                            existing_target,
+                                            detected_cnpj=top_cnpj,
+                                            company_name=None,
+                                            supplier_name=rep_supplier,
+                                            batch_warnings=batch_warnings,
+                                        )
+                            for raw_inv in fiscal_res.invoices:
                                 linked_cid, link_warn = resolve_contract_link(
                                     list_contracts(conn), raw_inv
                                 )
@@ -1988,6 +2831,12 @@ def ingest_uploaded_files(
                                     }
                                 )
                                 save_document(conn, saved_doc_final)
+
+                    sync_contract_dossier_data(
+                        conn,
+                        resolved_cid,
+                        auto_approve_above_threshold=auto_approve_above_threshold,
+                    )
 
                 if (
                     proc.document.read_quality is ReadQuality.OK
@@ -2032,9 +2881,157 @@ def ingest_uploaded_files(
                 )
             continue
 
-        # Processamento de cobranças (.xml, .csv, .xlsx ou fatura .pdf/.docx)
+        # Processamento de cobranças, OPs ou certidões (.xml, .csv, .xlsx ou PDF/DOCX)
         doc_id = f"doc-{uuid4().hex[:10]}"
         suffix = Path(file_name).suffix.casefold()
+        if suffix in {".csv", ".xlsx"}:
+            try:
+                sheet_kind = detect_spreadsheet_kind(raw_bytes, is_xlsx=(suffix == ".xlsx"))
+            except (OSError, ValueError):
+                sheet_kind = "INVOICES"
+
+            if sheet_kind == "PAYMENT_ORDERS":
+                fallback_cid = selected_contract_id or active_contract_id
+                try:
+                    orders = (
+                        import_payment_orders_csv(
+                            raw_bytes,
+                            default_contract_id=fallback_cid,
+                            source_document_id=doc_id,
+                        )
+                        if suffix == ".csv"
+                        else import_payment_orders_xlsx(
+                            raw_bytes,
+                            default_contract_id=fallback_cid,
+                            source_document_id=doc_id,
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    outcomes.append(
+                        UploadedFileOutcome(
+                            file_name=file_name,
+                            detected_kind="BILLING",
+                            warnings=(f"Falha ao importar OPs de '{file_name}': {exc}",),
+                        )
+                    )
+                    continue
+                target_cid = (
+                    orders[0].contract_id
+                    if orders and orders[0].contract_id is not None
+                    else fallback_cid
+                )
+                doc = receive_document(
+                    document_id=doc_id,
+                    contract_id=target_cid,
+                    document_type=DocumentType.SPREADSHEET,
+                    file_name=file_name,
+                    content=raw_bytes,
+                    received_at=timestamp,
+                    read_quality=ReadQuality.OK,
+                    extracted_text=(
+                        f"Planilha de ordens de pagamento '{file_name}' "
+                        f"({len(orders)} registro(s))."
+                    ),
+                    reviewed=False,
+                    conn=conn,
+                )
+                inv_lookup = (
+                    {
+                        inv.number.strip().casefold(): inv.id
+                        for inv in list_invoices(conn, target_cid)
+                    }
+                    if target_cid is not None
+                    else {}
+                )
+                for order in orders:
+                    cid = order.contract_id or target_cid
+                    matched_inv_id = inv_lookup.get(order.invoice_number.strip().casefold())
+                    save_payment_order(
+                        conn,
+                        order.model_copy(update={"contract_id": cid, "invoice_id": matched_inv_id}),
+                    )
+                    if cid is not None:
+                        affected_contract_ids.add(cid)
+                outcomes.append(
+                    UploadedFileOutcome(
+                        file_name=file_name,
+                        detected_kind="BILLING",
+                        document=doc,
+                        contract_id=target_cid,
+                        warnings=(),
+                    )
+                )
+                continue
+
+            if sheet_kind == "CERTIFICATES":
+                fallback_cid = selected_contract_id or active_contract_id
+                if fallback_cid is None:
+                    contracts_avail = list_contracts(conn)
+                    if len(contracts_avail) == 1:
+                        fallback_cid = contracts_avail[0].id
+                if fallback_cid is None:
+                    outcomes.append(
+                        UploadedFileOutcome(
+                            file_name=file_name,
+                            detected_kind="BILLING",
+                            warnings=(
+                                f"Selecione um contrato antes de importar certidões de "
+                                f"'{file_name}'.",
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    certs = (
+                        import_certificates_csv(
+                            raw_bytes,
+                            default_contract_id=fallback_cid,
+                            source_document_id=doc_id,
+                        )
+                        if suffix == ".csv"
+                        else import_certificates_xlsx(
+                            raw_bytes,
+                            default_contract_id=fallback_cid,
+                            source_document_id=doc_id,
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    outcomes.append(
+                        UploadedFileOutcome(
+                            file_name=file_name,
+                            detected_kind="BILLING",
+                            warnings=(f"Falha ao importar certidões de '{file_name}': {exc}",),
+                        )
+                    )
+                    continue
+                doc = receive_document(
+                    document_id=doc_id,
+                    contract_id=fallback_cid,
+                    document_type=DocumentType.SPREADSHEET,
+                    file_name=file_name,
+                    content=raw_bytes,
+                    received_at=timestamp,
+                    read_quality=ReadQuality.OK,
+                    extracted_text=(
+                        f"Planilha de certidões '{file_name}' ({len(certs)} registro(s))."
+                    ),
+                    reviewed=False,
+                    conn=conn,
+                )
+                for cert in certs:
+                    save_tax_certificate(conn, cert)
+                    affected_contract_ids.add(cert.contract_id)
+                outcomes.append(
+                    UploadedFileOutcome(
+                        file_name=file_name,
+                        detected_kind="BILLING",
+                        document=doc,
+                        contract_id=fallback_cid,
+                        warnings=(),
+                    )
+                )
+                continue
+
         if suffix in {".pdf", ".docx"} and client is None:
             parsed_bill = parsed_docs.get(f"{idx}:{file_name}") or _read_contract_bytes(
                 file_name, raw_bytes
@@ -2108,6 +3105,12 @@ def ingest_uploaded_files(
 
     audits_count = 0
     divergences_count = 0
+    for cid in sorted(affected_contract_ids):
+        sync_contract_dossier_data(
+            conn,
+            cid,
+            auto_approve_above_threshold=auto_approve_above_threshold,
+        )
     if affected_contract_ids or imported_invoice_ids:
         imported_id_set = set(imported_invoice_ids)
         seen_inv_ids: set[str] = set()
@@ -2262,10 +3265,14 @@ def delete_uploaded_document(
                 "DELETE FROM audits WHERE invoice_id = ?",
                 (inv_id,),
             ).rowcount
+            conn.execute("DELETE FROM payment_orders WHERE invoice_id = ?", (inv_id,))
             deleted_invoices += conn.execute(
                 "DELETE FROM invoices WHERE id = ?",
                 (inv_id,),
             ).rowcount
+        conn.execute("DELETE FROM payment_orders WHERE source_document_id = ?", (document_id,))
+        conn.execute("DELETE FROM tax_certificates WHERE source_document_id = ?", (document_id,))
+        conn.execute("DELETE FROM financial_summaries WHERE source_document_id = ?", (document_id,))
         conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
 
     return DocumentDeletionResult(
@@ -2362,8 +3369,11 @@ def delete_empty_contract(conn: sqlite3.Connection, contract_id: str) -> bool:
         list_documents(conn, contract_id)
         or list_rules(conn, contract_id)
         or list_invoices(conn, contract_id)
+        or list_payment_orders(conn, contract_id)
+        or list_tax_certificates(conn, contract_id)
     ):
         return False
     with conn:
+        conn.execute("DELETE FROM financial_summaries WHERE contract_id = ?", (contract_id,))
         deleted = conn.execute("DELETE FROM contracts WHERE id = ?", (contract_id,)).rowcount
     return deleted > 0

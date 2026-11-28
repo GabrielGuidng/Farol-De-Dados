@@ -1,6 +1,8 @@
 """Camada de serviços e API: casos de uso que compõem leitura, agentes, motor e SQLite."""
 
 from backend.api.services import (
+    AUTO_APPROVE_CONFIDENCE_THRESHOLD,
+    AUTO_APPROVE_USER,
     BatchUploadResult,
     CompetenceRulesResult,
     DocumentDeletionResult,
@@ -22,9 +24,13 @@ from backend.api.services import (
     fetch_contract,
     fetch_contracts,
     fetch_documents,
+    fetch_financial_summaries,
     fetch_invoices,
+    fetch_payment_cycle_audit,
+    fetch_payment_orders,
     fetch_reviews,
     fetch_rules,
+    fetch_tax_certificates,
     get_contract_timeline,
     get_rules_for_competence,
     import_billing_document,
@@ -40,10 +46,19 @@ from backend.api.services import (
     review_document,
     review_rule,
     seed_synthetic_demo,
+    sync_contract_dossier_data,
 )
-from backend.motor import RuleSelection, SelectionStatus, TimelineResult
+from backend.motor import (
+    PaymentCycleAuditResult,
+    PaymentFinding,
+    RuleSelection,
+    SelectionStatus,
+    TimelineResult,
+)
 
 __all__ = [
+    "AUTO_APPROVE_CONFIDENCE_THRESHOLD",
+    "AUTO_APPROVE_USER",
     "BatchUploadResult",
     "CompetenceRulesResult",
     "DocumentDeletionResult",
@@ -51,6 +66,8 @@ __all__ = [
     "DocumentReviewResult",
     "InvoiceAuditOutcome",
     "InvoiceImportResult",
+    "PaymentCycleAuditResult",
+    "PaymentFinding",
     "RuleReviewResult",
     "RuleSelection",
     "SelectionStatus",
@@ -68,9 +85,13 @@ __all__ = [
     "fetch_contract",
     "fetch_contracts",
     "fetch_documents",
+    "fetch_financial_summaries",
     "fetch_invoices",
+    "fetch_payment_cycle_audit",
+    "fetch_payment_orders",
     "fetch_reviews",
     "fetch_rules",
+    "fetch_tax_certificates",
     "get_contract_timeline",
     "get_rules_for_competence",
     "import_billing_document",
@@ -86,4 +107,5 @@ __all__ = [
     "review_document",
     "review_rule",
     "seed_synthetic_demo",
+    "sync_contract_dossier_data",
 ]
