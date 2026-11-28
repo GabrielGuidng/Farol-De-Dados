@@ -18,6 +18,7 @@ from backend.agentes import (
     TradutorExtractionPayload,
 )
 from backend.api import (
+    AUTO_APPROVE_USER,
     assign_invoice_contract,
     audit_stored_invoice,
     delete_all_uploaded_documents,
@@ -1486,12 +1487,14 @@ def test_ingest_dossier_docx_auto_audits_divergence_and_cleans_up_empty_contract
 
         saved_invoices = fetch_invoices(conn, "CT-2026-900")
         assert len(saved_invoices) == 1
+        rules_900 = fetch_rules(conn, "CT-2026-900")
+        assert rules_900[0].review_status is ReviewStatus.CONFIRMED
+
         audits = fetch_audits(conn, saved_invoices[0].id)
         assert len(audits) == 1
-        assert audits[0].result.classification is AuditClassification.NEEDS_REVIEW
+        assert audits[0].result.classification is AuditClassification.DIVERGENCE
         assert audits[0].result.difference == Decimal("2000.00")
 
-        rules_900 = fetch_rules(conn, "CT-2026-900")
         review_rule(
             conn,
             rules_900[0].id,
@@ -1759,7 +1762,7 @@ def test_ingest_realistic_commercial_dossier_pdf_with_masked_supplier_cnpj_and_f
         assert out_114.stored_audit.result.classification is AuditClassification.NEEDS_REVIEW
 
         # Exclusão individual de cobrança remove fatura e auditoria preservando trilha `reviews`
-        from backend.api import delete_stored_invoice, fetch_reviews
+        from backend.api import delete_stored_invoice
 
         reviews_before_del = len(fetch_reviews(conn))
         deleted_ok = delete_stored_invoice(conn, cs_invoices["NS-2026/114"].id)
@@ -1768,3 +1771,120 @@ def test_ingest_realistic_commercial_dossier_pdf_with_masked_supplier_cnpj_and_f
         assert len(fetch_invoices(conn, "CS-047/2026")) == 3
         assert len(fetch_audits(conn, cs_invoices["NS-2026/114"].id)) == 0
         assert len(fetch_reviews(conn)) == reviews_before_del
+
+
+def test_ingest_auto_approves_above_85_and_extracts_multiline_cnpj_and_validity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "auto_approve.db"
+    init_db(db_path).close()
+
+    contract_pdf = build_synthetic_pdf(
+        [
+            [
+                "CONTRATO ADMINISTRATIVO CT-2025-880",
+                "CONTRATANTE: Órgão Público Federal",
+                "CNPJ: 12.345.678/0001-95",
+                "CONTRATADA: Prestadora Alfa Serviços Ltda.",
+                "Razão social completa: Prestadora Alfa Serviços Ltda.",
+                "CNPJ: 28.741.963/0001-65",
+                "CLÁUSULA 3ª — DA VIGÊNCIA",
+                "A vigência do contrato será de 01/06/2025 até 31/05/2026.",
+                "CLÁUSULA 4ª — DO PREÇO",
+                "Valor mensal fixo de R$ 20.000,00.",
+            ]
+        ]
+    )
+    client_auto = FakeLLMClient(
+        [
+            JuristaExtractionPayload(
+                rules=(
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.MONTHLY_PRICE,
+                        new_value=Decimal("20000.00"),
+                        validity_start=date(2025, 6, 1),
+                        validity_end=date(2026, 5, 31),
+                        relation=RuleRelation.CREATED,
+                        page=1,
+                        literal_excerpt="Valor mensal fixo de R$ 20.000,00.",
+                    ),
+                    ExtractedRuleCandidate(
+                        rule_type=RuleType.INSS_RETENTION,
+                        new_value=Decimal("11.00"),
+                        validity_start=date(2025, 6, 1),
+                        relation=RuleRelation.CREATED,
+                        page=1,
+                        literal_excerpt="Trecho inexistente para forçar inconclusiva",
+                    ),
+                )
+            )
+        ]
+    )
+
+    with connect(db_path) as conn:
+        batch = ingest_uploaded_files(
+            conn,
+            [("contrato_alfa.pdf", contract_pdf)],
+            client=client_auto,
+            received_at=_TS,
+        )
+        saved_contract = fetch_contract(conn, "CT-2025-880")
+        assert saved_contract is not None
+        assert saved_contract.supplier_cnpj == "28741963000165"
+        assert saved_contract.validity.start == date(2025, 6, 1)
+        assert saved_contract.validity.end == date(2026, 5, 31)
+
+        rules = {r.rule_type: r for r in fetch_rules(conn, "CT-2025-880")}
+        monthly_rule = rules[RuleType.MONTHLY_PRICE]
+        inss_rule = rules[RuleType.INSS_RETENTION]
+        assert monthly_rule.review_status is ReviewStatus.CONFIRMED
+        assert inss_rule.review_status is ReviewStatus.INCONCLUSIVE
+        assert any("aprovada(s) automaticamente" in w for w in batch.warnings)
+
+        rule_reviews = fetch_reviews(
+            conn, target_type=ReviewTargetType.RULE, target_id=monthly_rule.id
+        )
+        assert len(rule_reviews) == 1
+        assert rule_reviews[0].user == AUTO_APPROVE_USER
+
+        # Regra auto-aprovada continua editável depois via review_rule.
+        edited = review_rule(
+            conn,
+            monthly_rule.id,
+            user="auditor.humano",
+            decision=ReviewDecision.CORRECT,
+            justification="Ajuste manual após revisão.",
+            corrected_rule=monthly_rule.model_copy(update={"value": Decimal("21000.00")}),
+            reviewed_at=_TS,
+        )
+        assert edited.rule.review_status is ReviewStatus.CORRECTED
+        assert edited.rule.value == Decimal("21000.00")
+
+        # Quando explicitamente desativado, mantém PENDING_REVIEW.
+        client_manual = FakeLLMClient(
+            [
+                JuristaExtractionPayload(
+                    rules=(
+                        ExtractedRuleCandidate(
+                            rule_type=RuleType.MONTHLY_PRICE,
+                            new_value=Decimal("20000.00"),
+                            validity_start=date(2025, 6, 1),
+                            relation=RuleRelation.CREATED,
+                            page=1,
+                            literal_excerpt="Valor mensal fixo de R$ 20.000,00.",
+                        ),
+                    )
+                )
+            ]
+        )
+        manual_proc = process_contract_document(
+            conn,
+            contract_id="CT-2025-880",
+            document_id="doc-manual-check",
+            file_name="contrato_manual.pdf",
+            content=contract_pdf,
+            client=client_manual,
+            received_at=_TS,
+            auto_approve_above_threshold=False,
+        )
+        assert manual_proc.rules[0].review_status is ReviewStatus.PENDING_REVIEW
