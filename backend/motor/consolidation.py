@@ -13,12 +13,15 @@ from backend.schemas import (
     Document,
     Invoice,
     ReferencePeriod,
+    calculate_cnpj_check_digits,
+    normalize_cnpj,
 )
 
 AMENDMENT_REVIEW_CHECK = "amendments_reviewed"
 RULE_START_CHECK = "rules_start_date"
 COMPETENCE_CHECK = "competence_inferred"
 CONTRACT_LINK_CHECK = "contract_link"
+_PROVISIONAL_CNPJ = "00000000000191"
 
 
 def consolidate_rules(rules: Sequence[ContractRule]) -> RuleConsolidation:
@@ -108,12 +111,69 @@ def check_competence_inferred(invoice: Invoice) -> Check:
     )
 
 
+def _format_cnpj_digits(digits: str) -> str:
+    if len(digits) != 14:
+        return digits
+    return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+
+
+def _check_raw_cnpj_validity(invoice: Invoice) -> str | None:
+    raw = (invoice.raw_supplier_cnpj or "").strip()
+    if not raw:
+        return None
+    digits = normalize_cnpj(raw)
+    if len(digits) != 14 or len(set(digits)) <= 1:
+        return f"O CNPJ informado na cobrança ({raw}) está incompleto ou inválido."
+    expected_dv = calculate_cnpj_check_digits(digits[:12])
+    if digits[12:] != expected_dv:
+        return (
+            f"O CNPJ do fornecedor ({raw}) possui dígito verificador inválido "
+            f"(esperado final -{expected_dv})."
+        )
+    return None
+
+
+def _describe_cnpj_mismatch(contract: Contract, invoice: Invoice) -> str:
+    raw_err = _check_raw_cnpj_validity(invoice)
+    if raw_err is not None:
+        if contract.supplier_cnpj == _PROVISIONAL_CNPJ:
+            return raw_err
+        return raw_err.rstrip(".") + " e difere do CNPJ do contrato."
+    if invoice.supplier_cnpj == _PROVISIONAL_CNPJ:
+        return (
+            "O CNPJ do fornecedor na cobrança não foi identificado ou é inválido e "
+            "difere do CNPJ do contrato."
+        )
+    inv_fmt = _format_cnpj_digits(invoice.supplier_cnpj)
+    contract_fmt = _format_cnpj_digits(contract.supplier_cnpj)
+    if invoice.supplier_cnpj[:8] == contract.supplier_cnpj[:8]:
+        return (
+            f"O CNPJ do emitente ({inv_fmt}) pertence a filial da contratada "
+            f"(mesma raiz, filial /{invoice.supplier_cnpj[8:12]} vs. "
+            f"/{contract.supplier_cnpj[8:12]} no contrato)."
+        )
+    return (
+        f"O CNPJ do emitente ({inv_fmt}) pertence a outro fornecedor diferente "
+        f"do contrato ({contract_fmt})."
+    )
+
+
 def check_contract_link(contract: Contract | None, invoice: Invoice) -> Check:
     """
     Cobrança sem vínculo seguro com o contrato (contrato ausente, id ou CNPJ divergentes) ou sem
     valor (total zero e sem itens) é pendência documental (MISSING_DOCUMENTATION).
+    Quando o contrato tem CNPJ provisório (não lido no instrumento), ainda valida o dígito da NF,
+    mas não reprova em cascata notas com CNPJ válido.
     """
     problem: str | None = None
+    raw_text = (invoice.raw_supplier_cnpj or "").strip()
+    is_masked_on_provisional = (
+        contract is not None
+        and contract.supplier_cnpj == _PROVISIONAL_CNPJ
+        and invoice.supplier_cnpj == _PROVISIONAL_CNPJ
+        and bool(raw_text)
+        and any(ch in "?*xX" for ch in raw_text)
+    )
     if contract is None or invoice.contract_id is None:
         problem = "A cobrança não tem vínculo com um contrato."
     elif invoice.contract_id != contract.id:
@@ -121,11 +181,31 @@ def check_contract_link(contract: Contract | None, invoice: Invoice) -> Check:
             f"A cobrança aponta o contrato {invoice.contract_id}, "
             f"mas o contrato informado é {contract.id}."
         )
-    elif invoice.supplier_cnpj != contract.supplier_cnpj:
-        problem = "O CNPJ do fornecedor da cobrança difere do CNPJ do contrato."
+    elif (
+        not is_masked_on_provisional and (raw_err := _check_raw_cnpj_validity(invoice)) is not None
+    ):
+        problem = (
+            raw_err
+            if contract.supplier_cnpj == _PROVISIONAL_CNPJ
+            else raw_err.rstrip(".") + " e difere do CNPJ do contrato."
+        )
+    elif (
+        contract.supplier_cnpj != _PROVISIONAL_CNPJ
+        and invoice.supplier_cnpj != contract.supplier_cnpj
+    ):
+        problem = _describe_cnpj_mismatch(contract, invoice)
     elif invoice.total == 0 and not invoice.items:
         problem = "A cobrança não informa total nem itens."
     if problem is None:
+        if contract is not None and contract.supplier_cnpj == _PROVISIONAL_CNPJ:
+            return Check(
+                name=CONTRACT_LINK_CHECK,
+                result=CheckResult.OK,
+                message=(
+                    "Vínculo por contrato ativo (CNPJ da contratada não foi lido no "
+                    "contrato — conferência de CNPJ contra o contrato omitida)."
+                ),
+            )
         return Check(
             name=CONTRACT_LINK_CHECK,
             result=CheckResult.OK,

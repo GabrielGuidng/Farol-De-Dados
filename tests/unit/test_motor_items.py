@@ -3,13 +3,27 @@
 from decimal import Decimal
 
 from backend.motor import (
+    HOURLY_LIMIT_CHECK,
+    HOURS_WITHOUT_OS_CHECK,
+    ITEMS_ARITHMETIC_CHECK,
     ReasonCode,
+    RuleSelection,
+    SelectionStatus,
+    check_hourly_items,
     check_item_classification,
+    check_items_arithmetic,
     check_items_total,
     classify_items,
+    select_fixed_base_item,
 )
-from backend.schemas import CheckResult
-from tests.fixtures.scenario import make_item, monthly_item, overage_item
+from backend.schemas import CheckResult, RuleType
+from tests.fixtures.scenario import (
+    make_invoice,
+    make_item,
+    make_rule,
+    monthly_item,
+    overage_item,
+)
 
 ZERO = Decimal("0.00")
 
@@ -93,3 +107,50 @@ def test_items_total_respects_tolerance_and_missing_items() -> None:
     items = [monthly_item("10000.00")]
     assert check_items_total(items, Decimal("10000.50"), Decimal("1.00")).result is CheckResult.OK
     assert check_items_total([], Decimal("10"), ZERO).result is CheckResult.REVIEW
+
+
+def test_discount_sla_items_are_separated_and_reconciled_in_total() -> None:
+    items = [
+        monthly_item("10000.00"),
+        make_item("Glosa de SLA (indisponibilidade)", "1", "500.00", "500.00"),
+    ]
+    cls = classify_items(items)
+    assert cls.base_unambiguous
+    assert len(cls.discount_items) == 1
+    assert check_items_total(items, Decimal("9500.00"), ZERO).result is CheckResult.OK
+
+
+def test_items_arithmetic_and_fixed_plus_hourly_checks() -> None:
+    bad_qty_item = make_item("Horas técnicas (OS 42)", "10", "150.00", "1800.00", "h")
+    arith_chk = check_items_arithmetic([bad_qty_item], ZERO)
+    assert arith_chk is not None
+    assert arith_chk.name == ITEMS_ARITHMETIC_CHECK
+    assert arith_chk.result is CheckResult.DIVERGENCE
+    assert "R$ 300,00" in arith_chk.message
+
+    fixed = monthly_item("10000.00")
+    hours_no_os = make_item("Horas técnicas sob demanda", "50", "150.00", "7500.00", "h")
+    selected = select_fixed_base_item([fixed, hours_no_os])
+    assert selected is fixed
+    # Dois itens fixos sem item variável/horário continuam ambíguos (preserva M-11).
+    two_fixed = [fixed, make_item("Licença de software", "1", "800", "800")]
+    assert select_fixed_base_item(two_fixed) is None
+
+    inv = make_invoice("inv-h1", "8823", "2026-04", [fixed, hours_no_os], total="17500.00")
+    franchise_sel = RuleSelection(
+        status=SelectionStatus.SELECTED,
+        rule=make_rule("fran-1", RuleType.FRANCHISE, quantity="40", start=inv.issue_date),
+    )
+    overage_sel = RuleSelection(
+        status=SelectionStatus.SELECTED,
+        rule=make_rule("over-1", RuleType.OVERAGE_PRICE, value="150.00", start=inv.issue_date),
+    )
+    h_checks, h_applied = check_hourly_items(
+        inv,
+        franchise_selection=franchise_sel,
+        overage_selection=overage_sel,
+        tolerance=ZERO,
+    )
+    assert [c.name for c in h_checks] == [HOURLY_LIMIT_CHECK, HOURS_WITHOUT_OS_CHECK]
+    assert "R$ 1.500,00" in h_checks[0].message
+    assert len(h_applied) == 2

@@ -23,6 +23,15 @@ from backend.motor.checks import (
     check_overage_price,
     check_overage_quantity,
 )
+from backend.motor.compliance import (
+    INSS_RETENTION_CHECK,
+    ISS_RETENTION_CHECK,
+    SUPPLIER_IDENTITY_CHECK,
+    UNAPPROVED_ADJUSTMENT_CHECK,
+    check_supplier_identity,
+    check_tax_retentions,
+    check_unapproved_adjustment_claim,
+)
 from backend.motor.consolidation import (
     check_amendment_review,
     check_competence_inferred,
@@ -31,12 +40,47 @@ from backend.motor.consolidation import (
 )
 from backend.motor.duplicates import (
     check_duplicates,
+    extract_af_tokens,
+)
+from backend.motor.extenso import (
+    WRITTEN_AMOUNT_CHECK,
+    check_written_amount,
+    parse_brl_extenso,
+)
+from backend.motor.item_prices import (
+    ITEM_QUANTITY_CUMULATIVE_CHECK,
+    ITEM_QUANTITY_MONTHLY_CHECK,
+    ITEM_UNIT_PRICE_CHECK,
+    MISSING_GLOSA_CHECK,
+    UNREGISTERED_ITEM_CHECK,
+    ItemPricesAuditResult,
+    audit_item_prices,
+    check_missing_glosa,
+    has_matching_item_rules,
+    match_invoice_item_to_rule_key,
 )
 from backend.motor.items import (
+    HOURLY_LIMIT_CHECK,
+    HOURS_WITHOUT_OS_CHECK,
+    ITEMS_ARITHMETIC_CHECK,
     ItemClassification,
+    check_hourly_items,
     check_item_classification,
+    check_items_arithmetic,
     check_items_total,
     classify_items,
+    select_fixed_base_item,
+)
+from backend.motor.payments import (
+    PAYMENT_APPROVAL_CHECK,
+    PAYMENT_ATTESTATION_CHECK,
+    PAYMENT_BENEFICIARY_CHECK,
+    PAYMENT_BUSINESS_DAY_CHECK,
+    PAYMENT_DUPLICATE_CHECK,
+    PAYMENT_SEGREGATION_CHECK,
+    PaymentCycleAuditResult,
+    PaymentFinding,
+    audit_payment_cycle,
 )
 from backend.motor.results import (
     CheckOutcome,
@@ -52,6 +96,8 @@ from backend.motor.results import (
 )
 from backend.motor.timeline import (
     apply_amendments,
+    normalize_item_key,
+    select_applicable_item_rules,
     select_applicable_rule,
 )
 from backend.motor.validity import (
@@ -60,10 +106,32 @@ from backend.motor.validity import (
 )
 
 __all__ = [
+    "HOURLY_LIMIT_CHECK",
+    "HOURS_WITHOUT_OS_CHECK",
+    "INSS_RETENTION_CHECK",
+    "ISS_RETENTION_CHECK",
+    "ITEMS_ARITHMETIC_CHECK",
+    "ITEM_QUANTITY_CUMULATIVE_CHECK",
+    "ITEM_QUANTITY_MONTHLY_CHECK",
+    "ITEM_UNIT_PRICE_CHECK",
+    "MISSING_GLOSA_CHECK",
+    "PAYMENT_APPROVAL_CHECK",
+    "PAYMENT_ATTESTATION_CHECK",
+    "PAYMENT_BENEFICIARY_CHECK",
+    "PAYMENT_BUSINESS_DAY_CHECK",
+    "PAYMENT_DUPLICATE_CHECK",
+    "PAYMENT_SEGREGATION_CHECK",
+    "SUPPLIER_IDENTITY_CHECK",
+    "UNAPPROVED_ADJUSTMENT_CHECK",
+    "UNREGISTERED_ITEM_CHECK",
+    "WRITTEN_AMOUNT_CHECK",
     "CheckOutcome",
     "ContractValidityResult",
     "DivergenceDirection",
     "ItemClassification",
+    "ItemPricesAuditResult",
+    "PaymentCycleAuditResult",
+    "PaymentFinding",
     "Reason",
     "ReasonCode",
     "RuleConsolidation",
@@ -76,26 +144,42 @@ __all__ = [
     "apply_amendments",
     "audit_invoice",
     "audit_invoices",
+    "audit_item_prices",
+    "audit_payment_cycle",
     "check_amendment_review",
     "check_competence_inferred",
     "check_contract_link",
     "check_contract_validity",
     "check_duplicates",
+    "check_hourly_items",
     "check_item_classification",
+    "check_items_arithmetic",
     "check_items_total",
+    "check_missing_glosa",
     "check_monthly_price",
     "check_overage",
     "check_overage_price",
     "check_overage_quantity",
     "check_periodic_adjustment",
+    "check_supplier_identity",
+    "check_tax_retentions",
+    "check_unapproved_adjustment_claim",
+    "check_written_amount",
     "classify_items",
     "consolidate_rules",
     "effective_contract_end",
+    "extract_af_tokens",
+    "has_matching_item_rules",
     "latest_due_adjustment",
+    "match_invoice_item_to_rule_key",
     "multiply_money",
+    "normalize_item_key",
+    "parse_brl_extenso",
     "percentage",
     "require_decimal",
     "round_money",
+    "select_applicable_item_rules",
     "select_applicable_rule",
+    "select_fixed_base_item",
     "subtract_money",
 ]

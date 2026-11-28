@@ -137,3 +137,39 @@ def test_m15_linked_invoice_is_ok() -> None:
         == CNPJ.replace(".", "").replace("/", "").replace("-", "")
     )
     assert check_contract_link(make_contract(), invoice).result is CheckResult.OK
+
+
+def test_provisional_contract_separates_invalid_branch_and_third_party() -> None:
+    provisional_contract = make_contract().model_copy(update={"supplier_cnpj": "00000000000191"})
+    valid_inv = make_invoice("ok-1", "8801", "2026-04", [monthly_item("10000.00")])
+    invalid_dv_inv = make_invoice(
+        "bad-dv", "8815", "2026-04", [monthly_item("10000.00")]
+    ).model_copy(update={"raw_supplier_cnpj": "11.222.333/0001-99"})
+
+    assert check_contract_link(provisional_contract, valid_inv).result is CheckResult.OK
+    dv_chk = check_contract_link(provisional_contract, invalid_dv_inv)
+    assert dv_chk.result is CheckResult.PENDING
+    assert "dígito verificador inválido" in dv_chk.message.casefold()
+
+    real_contract = make_contract()  # 11.222.333/0001-81
+    branch_inv = make_invoice(
+        "branch-1",
+        "8830",
+        "2026-04",
+        [monthly_item("10000.00")],
+        cnpj="11.222.333/0002-62",
+    )
+    branch_chk = check_contract_link(real_contract, branch_inv)
+    assert branch_chk.result is CheckResult.PENDING
+    assert "filial" in branch_chk.message.casefold()
+
+    other_inv = make_invoice(
+        "other-1",
+        "8890",
+        "2026-04",
+        [monthly_item("10000.00")],
+        cnpj="33.000.167/0001-01",
+    )
+    other_chk = check_contract_link(real_contract, other_inv)
+    assert other_chk.result is CheckResult.PENDING
+    assert "outro fornecedor" in other_chk.message.casefold()

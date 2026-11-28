@@ -33,11 +33,17 @@ def effective_contract_end(contract: Contract, extensions: Sequence[ContractRule
 
 
 def check_contract_validity(
-    contract: Contract, extensions: Sequence[ContractRule], reference_period: ReferencePeriod
+    contract: Contract,
+    extensions: Sequence[ContractRule],
+    reference_period: ReferencePeriod,
+    *,
+    issue_date: date | None = None,
 ) -> ContractValidityResult:
     """
     Recebe contrato, prorrogações e competência; devolve se o mês está dentro da vigência.
     Fora da vigência é NEEDS_REVIEW (não DIVERGENCE): a prorrogação pode não ter sido enviada.
+    Quando `issue_date > end` em competência que ultrapassa o fim do contrato (ex.: DANFE
+    emitida após o vencimento da Ata), classifica como OUTSIDE_CONTRACT_VALIDITY.
     """
     period = reference_period
     end = effective_contract_end(contract, extensions)
@@ -50,14 +56,24 @@ def check_contract_validity(
                 message=f"A competência {period} é anterior ao início da vigência do contrato.",
             )
         )
-    elif end is not None and period.first_day > end:
+    elif end is not None and (
+        period.first_day > end
+        or (period.last_day > end and issue_date is not None and issue_date > end)
+    ):
+        if period.first_day > end:
+            msg = (
+                f"A competência {period} está fora da vigência do contrato, que termina em "
+                f"{end.isoformat()}. Pode existir uma prorrogação que não foi enviada."
+            )
+        else:
+            issued_txt = issue_date.isoformat() if issue_date is not None else str(period)
+            msg = (
+                f"A nota foi emitida em {issued_txt}, após o fim da vigência em {end.isoformat()}."
+            )
         reasons.append(
             Reason(
                 code=ReasonCode.OUTSIDE_CONTRACT_VALIDITY,
-                message=(
-                    f"A competência {period} está fora da vigência do contrato, que termina em "
-                    f"{end.isoformat()}. Pode existir uma prorrogação que não foi enviada."
-                ),
+                message=msg,
             )
         )
         pending = [

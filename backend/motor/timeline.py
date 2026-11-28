@@ -1,5 +1,7 @@
 """Linha do tempo das regras: aplica aditivos e seleciona a regra vigente de uma competência."""
 
+import re
+import unicodedata
 from collections.abc import Sequence
 from datetime import date, timedelta
 
@@ -10,10 +12,23 @@ from backend.schemas import (
     ReferencePeriod,
     ReviewStatus,
     RuleRelation,
+    RuleType,
     ValidityPeriod,
 )
 
 _ONE_DAY = timedelta(days=1)
+_ITEM_STOP_WORDS = frozenset({"de", "da", "do", "dos", "das", "para", "com", "posto", "postos"})
+
+
+def normalize_item_key(name: str | None) -> str:
+    """Normaliza nome de item/posto para parear regras e itens sem sensibilidade a acento/caixa."""
+    if not name:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", name)
+    ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+    stripped_code = re.sub(r"^\s*\d{1,6}\s*[-–.]?\s*", "", ascii_only)
+    tokens = [tok for tok in re.findall(r"[a-z0-9]+", stripped_code) if tok not in _ITEM_STOP_WORDS]
+    return " ".join(tokens)
 
 
 def _reason(code: ReasonCode, message: str, *rule_ids: str) -> Reason:
@@ -126,13 +141,27 @@ def _apply_one(
         }
     )
     if new_rule is not None:
-        current[new_rule.id] = new_rule.model_copy(
-            update={
+        if new_rule.rule_type is RuleType.ITEM_PRICE and affected.rule_type is RuleType.ITEM_PRICE:
+            inherited_updates: dict[str, object] = {
                 "validity": ValidityPeriod(start=effective, end=new_rule.validity.end),
                 "relation": RuleRelation.ALTERED,
                 "version": affected.version + 1,
             }
-        )
+            if new_rule.quantity is None and affected.quantity is not None:
+                inherited_updates["quantity"] = affected.quantity
+            if new_rule.unit is None and affected.unit is not None:
+                inherited_updates["unit"] = affected.unit
+            if new_rule.quantity_scope is None and affected.quantity_scope is not None:
+                inherited_updates["quantity_scope"] = affected.quantity_scope
+            current[new_rule.id] = new_rule.model_copy(update=inherited_updates)
+        else:
+            current[new_rule.id] = new_rule.model_copy(
+                update={
+                    "validity": ValidityPeriod(start=effective, end=new_rule.validity.end),
+                    "relation": RuleRelation.ALTERED,
+                    "version": affected.version + 1,
+                }
+            )
 
 
 def apply_amendments(
@@ -166,6 +195,8 @@ def _terms(rule: ContractRule) -> tuple[object, ...]:
         rule.value,
         rule.quantity,
         rule.unit,
+        normalize_item_key(rule.item_name),
+        rule.quantity_scope,
         rule.adjustment_index,
         rule.periodicity_months,
     )
@@ -216,6 +247,12 @@ def select_applicable_rule(
     for index, left in enumerate(candidates):
         left_start, left_end = _clipped(left, period)
         for right in candidates[index + 1 :]:
+            if (
+                left.rule_type is RuleType.ITEM_PRICE
+                and right.rule_type is RuleType.ITEM_PRICE
+                and normalize_item_key(left.item_name) != normalize_item_key(right.item_name)
+            ):
+                continue
             right_start, right_end = _clipped(right, period)
             overlap = max(left_start, right_start) <= min(left_end, right_end)
             if overlap and _terms(left) != _terms(right):
@@ -264,3 +301,18 @@ def select_applicable_rule(
     return RuleSelection(
         status=SelectionStatus.SELECTED, rule=min(candidates, key=lambda rule: rule.id)
     )
+
+
+def select_applicable_item_rules(
+    rules: Sequence[ContractRule], reference_period: ReferencePeriod
+) -> dict[str, RuleSelection]:
+    """Seleciona, por `normalize_item_key(item_name)`, a regra ITEM_PRICE vigente no período."""
+    grouped: dict[str, list[ContractRule]] = {}
+    for rule in rules:
+        if rule.rule_type is not RuleType.ITEM_PRICE or rule.review_status is ReviewStatus.REJECTED:
+            continue
+        key = normalize_item_key(rule.item_name)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(rule)
+    return {key: select_applicable_rule(group, reference_period) for key, group in grouped.items()}
