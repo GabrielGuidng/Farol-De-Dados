@@ -24,11 +24,19 @@ class Invoice(StrictModel):
     contract_id: EntityId | None = None
     supplier: NonEmptyStr
     supplier_cnpj: Cnpj
+    raw_supplier_cnpj: str | None = None
+    supplier_legal_nature: str | None = None
     number: NonEmptyStr
     issue_date: PlainDate
+    attestation_date: PlainDate | None = None
     reference_period: ReferencePeriod
     competence_inferred: bool = False
     total: Money
+    inss_withheld: Money | None = None
+    iss_withheld: Money | None = None
+    net_total: Money | None = None
+    service_description: str | None = None
     measured_hours: Quantity | None = None
+    expected_glosa: Money | None = None
     source: InvoiceSource
     items: tuple[BillingItem, ...] = ()

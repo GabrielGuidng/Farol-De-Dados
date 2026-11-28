@@ -22,6 +22,10 @@ class Contract(StrictModel):
     company: NonEmptyStr
     supplier: NonEmptyStr
     supplier_cnpj: Cnpj
+    legal_nature: str | None = None
+    bank_code: str | None = None
+    bank_agency: str | None = None
+    bank_account: str | None = None
     subject: NonEmptyStr
     validity: ValidityPeriod
     comparison_tolerance: Money

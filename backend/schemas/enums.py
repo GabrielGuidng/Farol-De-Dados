@@ -59,10 +59,26 @@ class RuleType(StrEnum):
     """Tipo da regra contratual."""
 
     MONTHLY_PRICE = "MONTHLY_PRICE"
+    ITEM_PRICE = "ITEM_PRICE"
     FRANCHISE = "FRANCHISE"
     OVERAGE_PRICE = "OVERAGE_PRICE"
     ADJUSTMENT = "ADJUSTMENT"
     EXTENSION = "EXTENSION"
+    INSS_RETENTION = "INSS_RETENTION"
+    ISS_RETENTION = "ISS_RETENTION"
+    APPROVAL_LIMIT = "APPROVAL_LIMIT"
+    PAYMENT_TERMS = "PAYMENT_TERMS"
+
+
+class CertificateType(StrEnum):
+    """Tipo de certidão de regularidade fiscal, trabalhista ou garantia."""
+
+    CND_FEDERAL = "CND_FEDERAL"
+    CRF_FGTS = "CRF_FGTS"
+    CNDT = "CNDT"
+    CND_ESTADUAL = "CND_ESTADUAL"
+    CND_MUNICIPAL = "CND_MUNICIPAL"
+    CONTRACT_GUARANTEE = "CONTRACT_GUARANTEE"
 
 
 class DocumentType(StrEnum):
