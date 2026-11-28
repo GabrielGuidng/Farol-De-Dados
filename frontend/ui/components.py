@@ -13,6 +13,7 @@ from frontend.ui.formatting import (
     RULE_TYPE_LABELS,
     format_brl,
     format_date_br,
+    format_percent,
     format_quantity,
 )
 
@@ -255,10 +256,25 @@ def render_html_table(
 
 def describe_rule_value(rule: ContractRule) -> str:
     """Resume o parâmetro principal da regra contratual em formato legível."""
-    if rule.rule_type in (RuleType.MONTHLY_PRICE, RuleType.OVERAGE_PRICE):
-        return format_brl(rule.value)
-    if rule.rule_type is RuleType.FRANCHISE:
-        return format_quantity(rule.quantity, rule.unit)
+    if rule.rule_type in (
+        RuleType.MONTHLY_PRICE,
+        RuleType.OVERAGE_PRICE,
+        RuleType.APPROVAL_LIMIT,
+    ):
+        prefix = "Até " if rule.rule_type is RuleType.APPROVAL_LIMIT else ""
+        return f"{prefix}{format_brl(rule.value)}"
+    if rule.rule_type is RuleType.ITEM_PRICE:
+        label = rule.item_name or "Item"
+        if rule.quantity is not None:
+            scope_suffix = " acum." if rule.quantity_scope == "TOTAL" else "/mês"
+            qty_txt = format_quantity(rule.quantity, rule.unit or None)
+            return f"{label}: {format_brl(rule.value)} ({qty_txt}{scope_suffix})"
+        return f"{label}: {format_brl(rule.value)}"
+    if rule.rule_type in (RuleType.INSS_RETENTION, RuleType.ISS_RETENTION):
+        return f"{format_percent(rule.value)} sobre bruto"
+    if rule.rule_type in (RuleType.FRANCHISE, RuleType.PAYMENT_TERMS):
+        default_unit = "dias" if rule.rule_type is RuleType.PAYMENT_TERMS else ""
+        return format_quantity(rule.quantity, rule.unit or default_unit or None)
     if rule.rule_type is RuleType.ADJUSTMENT:
         periodicity = f" a cada {rule.periodicity_months} meses" if rule.periodicity_months else ""
         return f"{rule.adjustment_index or 'Índice não informado'}{periodicity}"

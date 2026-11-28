@@ -5,7 +5,7 @@ import html
 import io
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Literal
 
 from openpyxl import Workbook
@@ -13,15 +13,35 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from backend.motor import (
+    HOURLY_LIMIT_CHECK,
+    HOURS_WITHOUT_OS_CHECK,
+    INSS_RETENTION_CHECK,
+    ISS_RETENTION_CHECK,
+    ITEM_QUANTITY_CUMULATIVE_CHECK,
+    ITEM_QUANTITY_MONTHLY_CHECK,
+    ITEM_UNIT_PRICE_CHECK,
+    ITEMS_ARITHMETIC_CHECK,
+    MISSING_GLOSA_CHECK,
+    SUPPLIER_IDENTITY_CHECK,
+    UNAPPROVED_ADJUSTMENT_CHECK,
+    UNREGISTERED_ITEM_CHECK,
+    WRITTEN_AMOUNT_CHECK,
+    PaymentCycleAuditResult,
+)
 from backend.motor.duplicates import DUPLICATE_CHECK
 from backend.persistencia import StoredAudit
 from backend.schemas import (
     AuditClassification,
     Check,
     CheckResult,
+    Contract,
     ContractRule,
+    DivergenceDirection,
     Invoice,
     ReviewStatus,
+    RuleType,
+    is_valid_cnpj,
     most_severe,
 )
 from frontend.ui.components import describe_rule_value
@@ -41,6 +61,7 @@ from frontend.ui.formatting import (
     humanize_check_name,
     natural_invoice_sort_key,
     natural_number_sort_tuple,
+    parse_decimal_input,
     period_sort_tuple,
 )
 from frontend.ui.tokens import THEMES
@@ -48,22 +69,61 @@ from frontend.ui.tokens import THEMES
 FindingSeverity = Literal["Alta", "Média", "Baixa"]
 
 _ZERO = Decimal("0.00")
+_PROVISIONAL_CNPJ = "00000000000191"
 _SEVERITY_RANK: dict[FindingSeverity, int] = {"Alta": 0, "Média": 1, "Baixa": 2}
 _CHECK_PRIORITY: dict[str, int] = {
     "contract_link": 0,
-    "monthly_price": 1,
-    "overage_price": 2,
-    "contract_validity": 3,
-    "overage_quantity": 4,
-    "item_classification": 5,
-    "items_total": 6,
-    "rule_timeline": 7,
-    "amendments_reviewed": 8,
-    "rules_start_date": 9,
-    "periodic_adjustment": 10,
-    "competence_inferred": 11,
-    DUPLICATE_CHECK: 12,
+    "contract_validity": 1,
+    ITEMS_ARITHMETIC_CHECK: 2,
+    MISSING_GLOSA_CHECK: 2,
+    UNREGISTERED_ITEM_CHECK: 2,
+    ITEM_UNIT_PRICE_CHECK: 3,
+    ITEM_QUANTITY_MONTHLY_CHECK: 3,
+    ITEM_QUANTITY_CUMULATIVE_CHECK: 3,
+    "monthly_price": 3,
+    "overage_price": 4,
+    HOURLY_LIMIT_CHECK: 5,
+    UNAPPROVED_ADJUSTMENT_CHECK: 6,
+    INSS_RETENTION_CHECK: 7,
+    ISS_RETENTION_CHECK: 8,
+    "overage_quantity": 9,
+    HOURS_WITHOUT_OS_CHECK: 10,
+    WRITTEN_AMOUNT_CHECK: 11,
+    "item_classification": 12,
+    "items_total": 13,
+    "rule_timeline": 14,
+    "amendments_reviewed": 15,
+    "rules_start_date": 16,
+    "periodic_adjustment": 17,
+    SUPPLIER_IDENTITY_CHECK: 18,
+    "competence_inferred": 19,
+    DUPLICATE_CHECK: 20,
 }
+_PLACEHOLDER_SUPPLIER_NAMES = frozenset(
+    {
+        "fornecedor identificado no documento",
+        "fornecedor (cnpj não informado no arquivo)",
+        "empresa contratante (importação direta)",
+        "fornecedor",
+        "contratada",
+    }
+)
+_SAFETY_LOCK_CADASTRO_PROBLEMS = frozenset(
+    {
+        "CNPJ de fornecedor diferente do contrato",
+        "Razão social / natureza jurídica diverge do contrato",
+        "Emitida por filial (CNPJ diferente da matriz)",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ReadingCoverageItem:
+    """Indicador compacto do que foi lido com êxito no contrato antes da auditoria."""
+
+    label: str
+    ok: bool
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -83,14 +143,17 @@ class AuditFinding:
 
     @property
     def invoices_label(self) -> str:
-        """Formata lista de notas afetadas (`1046 e 1047` ou `1051`)."""
+        """Formata lista de notas afetadas (`1046 e 1047`, até 6 listadas ou resumo)."""
         if not self.invoice_numbers:
             return "—"
         if len(self.invoice_numbers) == 1:
             return self.invoice_numbers[0]
         if len(self.invoice_numbers) == 2:
             return f"{self.invoice_numbers[0]} e {self.invoice_numbers[1]}"
-        return f"{', '.join(self.invoice_numbers[:-1])} e {self.invoice_numbers[-1]}"
+        if len(self.invoice_numbers) <= 6:
+            return f"{', '.join(self.invoice_numbers[:-1])} e {self.invoice_numbers[-1]}"
+        head = ", ".join(self.invoice_numbers[:3])
+        return f"{len(self.invoice_numbers)} NFs ({head}, …, {self.invoice_numbers[-1]})"
 
 
 @dataclass(frozen=True)
@@ -143,6 +206,15 @@ class AppendixEntry:
     difference_display: str
     checks: tuple[AppendixCheckItem, ...]
     clauses: tuple[AppendixClauseQuote, ...]
+    severity_label: FindingSeverity | None = None
+
+
+@dataclass(frozen=True)
+class ContractSectionReport:
+    """Sub-relatório escopado de um contrato dentro de um lote multicontrato."""
+
+    contract: Contract
+    summary: "ExecutiveReportSummary"
 
 
 @dataclass(frozen=True)
@@ -164,6 +236,9 @@ class ExecutiveReportSummary:
     competence_rows: tuple[CompetenceSemaphoreRow, ...]
     clean_summary_line: str
     appendix_entries: tuple[AppendixEntry, ...]
+    reading_coverage: tuple[ReadingCoverageItem, ...] = ()
+    reading_warnings: tuple[str, ...] = ()
+    contract_sections: tuple[ContractSectionReport, ...] = ()
 
 
 def _esc(value: object) -> str:
@@ -256,16 +331,233 @@ def _group_duplicate_components(
     return components
 
 
-def _classify_non_duplicate_issue(
+def _extract_retention_shortfall(chk: Check) -> Decimal | None:
+    if chk.direction is not DivergenceDirection.UNDERCHARGE:
+        return None
+    for line in reversed(chk.calculation_memory):
+        if "diferença na retenção" in line.casefold() and "=" in line:
+            tail = line.rsplit("=", 1)[-1].strip()
+            try:
+                val = parse_decimal_input(tail)
+            except (InvalidOperation, ValueError):
+                continue
+            return abs(val) if val != _ZERO else None
+    return None
+
+
+def _extract_memory_money(chk: Check, prefix: str) -> Decimal | None:
+    prefix_low = prefix.casefold()
+    for line in reversed(chk.calculation_memory):
+        if prefix_low in line.casefold() and "=" in line:
+            tail = line.rsplit("=", 1)[-1].strip()
+            try:
+                val = parse_decimal_input(tail)
+            except (InvalidOperation, ValueError):
+                continue
+            return abs(val) if val != _ZERO else None
+    return None
+
+
+def _extract_signed_memory_money(chk: Check, prefix: str) -> Decimal | None:
+    prefix_low = prefix.casefold()
+    for line in reversed(chk.calculation_memory):
+        if prefix_low in line.casefold() and "=" in line:
+            tail = line.rsplit("=", 1)[-1].strip()
+            try:
+                val = parse_decimal_input(tail)
+            except (InvalidOperation, ValueError):
+                continue
+            return val if val != _ZERO else None
+    return None
+
+
+def _build_reading_diagnostics(
+    contracts: Sequence[Contract],
+    rules: Sequence[ContractRule],
+) -> tuple[tuple[ReadingCoverageItem, ...], tuple[str, ...]]:
+    """Resume o que foi lido do contrato e gera um único aviso por falha de leitura."""
+    if not contracts and not rules:
+        return (), ()
+
+    active_rules = [r for r in rules if r.review_status is not ReviewStatus.REJECTED]
+    coverage: list[ReadingCoverageItem] = []
+    warnings: list[str] = []
+
+    if contracts:
+        has_real_cnpj = all(
+            c.supplier_cnpj != _PROVISIONAL_CNPJ and is_valid_cnpj(c.supplier_cnpj)
+            for c in contracts
+        )
+        has_real_name = all(
+            c.supplier.strip().casefold() not in _PLACEHOLDER_SUPPLIER_NAMES for c in contracts
+        )
+        if has_real_cnpj and has_real_name:
+            sup_ok = True
+            sup_detail = "Lido"
+        elif has_real_cnpj:
+            sup_ok = False
+            sup_detail = "Parcial"
+            warnings.append(
+                "Razão social do fornecedor não identificada no contrato (apenas CNPJ lido)."
+            )
+        else:
+            sup_ok = False
+            sup_detail = "Não lido"
+            warnings.append(
+                "Não foi possível ler o CNPJ da contratada no contrato — "
+                "a conferência de CNPJ contra o contrato foi omitida."
+            )
+        coverage.append(
+            ReadingCoverageItem(
+                label="Fornecedor / CNPJ",
+                ok=sup_ok,
+                detail=sup_detail,
+            )
+        )
+
+        has_validity = all(
+            c.validity.start is not None or c.validity.end is not None for c in contracts
+        )
+        coverage.append(
+            ReadingCoverageItem(
+                label="Vigência do contrato",
+                ok=has_validity,
+                detail="Lida" if has_validity else "Não lida",
+            )
+        )
+        if not has_validity:
+            warnings.append(
+                "Não foi possível ler o período de vigência no contrato — "
+                "a conferência de prazo contratual foi omitida."
+            )
+
+    has_price = any(
+        r.rule_type
+        in (RuleType.MONTHLY_PRICE, RuleType.ITEM_PRICE, RuleType.OVERAGE_PRICE, RuleType.FRANCHISE)
+        for r in active_rules
+    )
+    coverage.append(
+        ReadingCoverageItem(
+            label="Preço / Itens",
+            ok=has_price,
+            detail="Lido" if has_price else "Não lido",
+        )
+    )
+    if not has_price:
+        warnings.append(
+            "Nenhuma regra de preço mensal foi extraída do contrato — "
+            "a comparação de preço unitário/mensal foi omitida."
+        )
+
+    has_retentions = any(
+        r.rule_type in (RuleType.INSS_RETENTION, RuleType.ISS_RETENTION) for r in active_rules
+    )
+    coverage.append(
+        ReadingCoverageItem(
+            label="Retenções (INSS/ISS)",
+            ok=has_retentions,
+            detail="Lidas" if has_retentions else "Não lidas",
+        )
+    )
+
+    has_adjustment = any(r.rule_type is RuleType.ADJUSTMENT for r in active_rules)
+    coverage.append(
+        ReadingCoverageItem(
+            label="Reajuste contratual",
+            ok=has_adjustment,
+            detail="Lido" if has_adjustment else "Não lido",
+        )
+    )
+
+    return tuple(coverage), tuple(warnings)
+
+
+def _group_identical_findings(findings: Sequence[AuditFinding]) -> list[AuditFinding]:
+    """Consolida achados idênticos sem valor em risco numa única linha com lista de notas."""
+    passthrough: list[AuditFinding] = []
+    buckets: dict[tuple[FindingSeverity, str, str], list[AuditFinding]] = {}
+    for f in findings:
+        if f.risk_amount is not None:
+            passthrough.append(f)
+            continue
+        key = (f.severity, f.problem, f.suggested_action)
+        buckets.setdefault(key, []).append(f)
+
+    grouped: list[AuditFinding] = list(passthrough)
+    for bucket in buckets.values():
+        if len(bucket) == 1:
+            grouped.append(bucket[0])
+            continue
+        pairs: dict[str, tuple[str, str]] = {}
+        seen_ids: list[str] = []
+        comps: set[str] = set()
+        for item in bucket:
+            comps.add(item.competence)
+            for num, iid in zip(item.invoice_numbers, item.invoice_ids, strict=False):
+                if iid not in pairs:
+                    pairs[iid] = (num, iid)
+                    seen_ids.append(iid)
+            for num in item.invoice_numbers:
+                if not item.invoice_ids and num not in pairs:
+                    pairs[num] = (num, "")
+        sorted_nums = sorted(
+            dict.fromkeys(num for item in bucket for num in item.invoice_numbers),
+            key=natural_number_sort_tuple,
+        )
+        ordered_ids = tuple(
+            dict.fromkeys(iid for item in bucket for iid in item.invoice_ids if iid)
+        )
+        comp_label = next(iter(comps)) if len(comps) == 1 else "Várias competências"
+        first = min(bucket, key=lambda it: (it.sort_period, it.sort_number))
+        grouped.append(
+            AuditFinding(
+                severity=first.severity,
+                invoice_numbers=tuple(sorted_nums),
+                invoice_ids=ordered_ids,
+                competence=comp_label,
+                sort_period=first.sort_period,
+                sort_number=natural_number_sort_tuple(sorted_nums[0])
+                if sorted_nums
+                else first.sort_number,
+                problem=first.problem,
+                amount_display=first.amount_display,
+                risk_amount=None,
+                suggested_action=first.suggested_action,
+            )
+        )
+    return grouped
+
+
+def _compute_exposure_total(
+    findings: Sequence[AuditFinding],
+    invoice_totals_by_id: dict[str, Decimal],
+) -> Decimal:
+    """Calcula exposição financeira sem duplicar valor quando 1 nota tem 2 bloqueios integrais."""
+    per_invoice_risk: dict[str, Decimal] = {}
+    other_risk = _ZERO
+    for f in findings:
+        if f.risk_amount is None or f.risk_amount <= _ZERO:
+            continue
+        if len(f.invoice_ids) == 1:
+            iid = f.invoice_ids[0]
+            cap = invoice_totals_by_id.get(iid)
+            accumulated = per_invoice_risk.get(iid, _ZERO) + f.risk_amount
+            per_invoice_risk[iid] = min(cap, accumulated) if cap is not None else accumulated
+        else:
+            other_risk += f.risk_amount
+    return sum(per_invoice_risk.values(), _ZERO) + other_risk
+
+
+def _classify_non_duplicate_issues(
     invoice: Invoice,
     stored: StoredAudit,
     *,
     doc_names: dict[str, str] | None,
-) -> AuditFinding | None:
-    """Traduz divergência ou pendência individual (fora duplicidade) em achado acionável."""
+) -> list[AuditFinding]:
+    """Traduz divergências e pendências da NF (inclusive múltiplas na mesma nota) em achados."""
     res = stored.result
     if res.classification is AuditClassification.NO_DIVERGENCE:
-        return None
+        return []
 
     non_dup_issues = [
         chk
@@ -275,47 +567,16 @@ def _classify_non_duplicate_issue(
     comp_pt = format_competence_pt(res.reference_period)
     sort_p = period_sort_tuple(res.reference_period)
     sort_n = natural_number_sort_tuple(invoice.number)
+    findings_out: list[AuditFinding] = []
+    handled_names: set[str] = set()
 
-    if res.difference is not None and res.difference > _ZERO:
-        is_confirmed_rule = res.classification is AuditClassification.DIVERGENCE
-        return AuditFinding(
-            severity="Alta" if is_confirmed_rule else "Média",
-            invoice_numbers=(invoice.number,),
-            invoice_ids=(invoice.id,),
-            competence=comp_pt,
-            sort_period=sort_p,
-            sort_number=sort_n,
-            problem=(
-                "Cobrado acima do contrato"
-                if is_confirmed_rule
-                else "Possível cobrança acima do contrato"
-            ),
-            amount_display=format_signed_brl(res.difference),
-            risk_amount=res.difference,
-            suggested_action=(
-                "Exigir aditivo ou estorno"
-                if is_confirmed_rule
-                else "Confirmar regra no contrato e exigir estorno"
-            ),
-        )
-
-    if res.difference is not None and res.difference < _ZERO:
-        return AuditFinding(
-            severity="Baixa",
-            invoice_numbers=(invoice.number,),
-            invoice_ids=(invoice.id,),
-            competence=comp_pt,
-            sort_period=sort_p,
-            sort_number=sort_n,
-            problem="Cobrado abaixo do contrato",
-            amount_display=format_signed_brl(res.difference),
-            risk_amount=None,
-            suggested_action="Conferir desconto ou faturamento parcial",
-        )
-
-    if res.classification is AuditClassification.MISSING_DOCUMENTATION:
-        if invoice.contract_id is None:
-            return AuditFinding(
+    # 1. Cobrança sem contrato vinculado (caso órfão integral)
+    if (
+        invoice.contract_id is None
+        and res.classification is AuditClassification.MISSING_DOCUMENTATION
+    ):
+        return [
+            AuditFinding(
                 severity="Alta",
                 invoice_numbers=(invoice.number,),
                 invoice_ids=(invoice.id,),
@@ -327,39 +588,472 @@ def _classify_non_duplicate_issue(
                 risk_amount=invoice.total,
                 suggested_action="Vincular contrato ou bloquear pagamento",
             )
-        link_msgs = " ".join(chk.message for chk in non_dup_issues if chk.name == "contract_link")
-        if "cnpj" in link_msgs.casefold():
-            return AuditFinding(
-                severity="Média",
+        ]
+
+    # 2. Preço mensal / excedente acima ou abaixo do contrato
+    has_monthly_or_overage_issue = any(
+        chk.name in {"monthly_price", "overage_price"}
+        and chk.result in (CheckResult.DIVERGENCE, CheckResult.REVIEW)
+        for chk in non_dup_issues
+    )
+    has_granular_item_issue = any(
+        chk.name
+        in {
+            UNREGISTERED_ITEM_CHECK,
+            ITEM_UNIT_PRICE_CHECK,
+            ITEM_QUANTITY_MONTHLY_CHECK,
+            ITEM_QUANTITY_CUMULATIVE_CHECK,
+            MISSING_GLOSA_CHECK,
+            "items_total",
+        }
+        for chk in non_dup_issues
+    )
+    if (
+        res.difference is not None
+        and res.difference > _ZERO
+        and (has_monthly_or_overage_issue or not has_granular_item_issue)
+    ):
+        is_confirmed_rule = res.classification is AuditClassification.DIVERGENCE
+        has_unapproved_adj = any(chk.name == UNAPPROVED_ADJUSTMENT_CHECK for chk in non_dup_issues)
+        problem = (
+            "Cobrado acima do contrato (reajuste sem aditivo)"
+            if (is_confirmed_rule and has_unapproved_adj)
+            else (
+                "Cobrado acima do contrato"
+                if is_confirmed_rule
+                else "Possível cobrança acima do contrato"
+            )
+        )
+        findings_out.append(
+            AuditFinding(
+                severity="Alta" if is_confirmed_rule else "Média",
                 invoice_numbers=(invoice.number,),
                 invoice_ids=(invoice.id,),
                 competence=comp_pt,
                 sort_period=sort_p,
                 sort_number=sort_n,
-                problem="CNPJ inválido",
+                problem=problem,
+                amount_display=format_signed_brl(res.difference),
+                risk_amount=res.difference,
+                suggested_action=(
+                    "Exigir aditivo ou estorno"
+                    if is_confirmed_rule
+                    else "Confirmar regra no contrato e exigir estorno"
+                ),
+            )
+        )
+        handled_names.update({"monthly_price", "overage_price", UNAPPROVED_ADJUSTMENT_CHECK})
+    elif (
+        res.difference is not None
+        and res.difference < _ZERO
+        and (has_monthly_or_overage_issue or not has_granular_item_issue)
+    ):
+        findings_out.append(
+            AuditFinding(
+                severity="Baixa",
+                invoice_numbers=(invoice.number,),
+                invoice_ids=(invoice.id,),
+                competence=comp_pt,
+                sort_period=sort_p,
+                sort_number=sort_n,
+                problem="Cobrado abaixo do contrato",
+                amount_display=format_signed_brl(res.difference),
+                risk_amount=None,
+                suggested_action="Conferir desconto ou faturamento parcial",
+            )
+        )
+        handled_names.update({"monthly_price", "overage_price"})
+
+    # 2b. Checks granulares de ITEM_PRICE e Glosas de frequência
+    for chk in non_dup_issues:
+        if chk.name == UNREGISTERED_ITEM_CHECK:
+            handled_names.add(UNREGISTERED_ITEM_CHECK)
+            risk_val = _extract_memory_money(chk, "valor cobrado sem previsão")
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta" if chk.result is CheckResult.DIVERGENCE else "Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Cobrança de item não previsto no contrato/Ata",
+                    amount_display=format_signed_brl(risk_val) if risk_val is not None else "n/a",
+                    risk_amount=risk_val,
+                    suggested_action="Glosar item não constante do contrato/Ata",
+                )
+            )
+        elif chk.name == ITEM_UNIT_PRICE_CHECK:
+            handled_names.add(ITEM_UNIT_PRICE_CHECK)
+            unit_diff = _extract_signed_memory_money(chk, "diferença acumulada no preço unitário")
+            if unit_diff is None:
+                unit_diff = res.difference
+            risk_val = unit_diff if (unit_diff is not None and unit_diff > _ZERO) else None
+            is_premature = "antes do início da vigência" in chk.message.casefold()
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta" if chk.result is CheckResult.DIVERGENCE else "Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem=(
+                        "Repactuação/aditivo aplicado antes do início da vigência"
+                        if is_premature
+                        else "Preço unitário acima do registrado no contrato/Ata"
+                    ),
+                    amount_display=format_signed_brl(unit_diff) if unit_diff is not None else "n/a",
+                    risk_amount=risk_val,
+                    suggested_action=(
+                        "Estornar aplicação antecipada até a data de efeito"
+                        if is_premature
+                        else "Glosar diferença unitária e cobrar preço contratado"
+                    ),
+                )
+            )
+        elif chk.name == ITEM_QUANTITY_MONTHLY_CHECK:
+            handled_names.add(ITEM_QUANTITY_MONTHLY_CHECK)
+            excess_val = _extract_memory_money(chk, "excesso")
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta" if chk.result is CheckResult.DIVERGENCE else "Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Quantidade mensal cobrada acima da contratada",
+                    amount_display=(
+                        format_signed_brl(excess_val) if excess_val is not None else "n/a"
+                    ),
+                    risk_amount=excess_val,
+                    suggested_action="Glosar postos/unidades excedentes ao contratado no mês",
+                )
+            )
+        elif chk.name == ITEM_QUANTITY_CUMULATIVE_CHECK:
+            handled_names.add(ITEM_QUANTITY_CUMULATIVE_CHECK)
+            excess_val = _extract_memory_money(chk, "excesso acumulado")
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta" if chk.result is CheckResult.DIVERGENCE else "Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Saldo acumulado do item acima do teto da Ata",
+                    amount_display=(
+                        format_signed_brl(excess_val) if excess_val is not None else "n/a"
+                    ),
+                    risk_amount=excess_val,
+                    suggested_action="Glosar quantidade além do limite global da Ata",
+                )
+            )
+        elif chk.name == MISSING_GLOSA_CHECK:
+            handled_names.add(MISSING_GLOSA_CHECK)
+            glosa_val = _extract_memory_money(chk, "glosa faltante")
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Glosa de frequência não descontada na nota",
+                    amount_display=(
+                        format_signed_brl(glosa_val) if glosa_val is not None else "n/a"
+                    ),
+                    risk_amount=glosa_val,
+                    suggested_action="Efetuar glosa de frequência antes do pagamento",
+                )
+            )
+
+    # 3. Pendência de CNPJ / vínculo documental (separando dígito inválido, filial e terceiro)
+    for chk in non_dup_issues:
+        if chk.name != "contract_link":
+            continue
+        handled_names.add("contract_link")
+        msg_low = chk.message.casefold()
+        if "dígito verificador inválido" in msg_low or "incompleto ou inválido" in msg_low:
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="CNPJ com dígito verificador inválido",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Pedir NF corrigida ou carta de correção",
+                )
+            )
+        elif "filial" in msg_low:
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Emitida por filial (CNPJ diferente da matriz)",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Confirmar se o contrato autoriza faturamento por filial",
+                )
+            )
+        elif "outro fornecedor" in msg_low:
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="CNPJ de fornecedor diferente do contrato",
+                    amount_display=format_brl(invoice.total),
+                    risk_amount=invoice.total,
+                    suggested_action="Bloquear pagamento e apurar faturamento por terceiro",
+                )
+            )
+        elif "cnpj" in msg_low:
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="CNPJ inválido",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Pedir NF corrigida",
+                )
+            )
+        else:
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Documentação incompleta",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Solicitar documentação complementar",
+                )
+            )
+
+    # 3b. Vigência do contrato: separa mudança no meio da competência (Média, n/a) de fora (Alta)
+    for chk in non_dup_issues:
+        if chk.name != "contract_validity":
+            continue
+        handled_names.add("contract_validity")
+        mem_txt = " ".join(chk.calculation_memory).casefold()
+        msg_low = chk.message.casefold()
+        is_outside = (
+            "codigo = outside_contract_validity" in mem_txt
+            or "fora da vigência" in msg_low
+            or "após o fim da vigência" in msg_low
+            or "anterior ao início da vigência" in msg_low
+        )
+        if is_outside:
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem=(
+                        "Emissão após o fim da vigência do contrato"
+                        if "após o fim da vigência" in msg_low
+                        else "Competência fora da vigência do contrato"
+                    ),
+                    amount_display=format_brl(invoice.total),
+                    risk_amount=invoice.total,
+                    suggested_action="Verificar aditivo de prorrogação ou bloquear pagamento",
+                )
+            )
+        else:
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Vigência inicia ou termina no meio da competência",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Conferir proporcionalidade (pró-rata) na competência",
+                )
+            )
+
+    # 4. Retenções tributárias (INSS / ISS)
+    for chk in non_dup_issues:
+        if chk.name not in (INSS_RETENTION_CHECK, ISS_RETENTION_CHECK):
+            continue
+        handled_names.add(chk.name)
+        tax_label = "INSS" if chk.name == INSS_RETENTION_CHECK else "ISS"
+        shortfall = _extract_retention_shortfall(chk)
+        if shortfall is not None:
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem=f"Retenção de {tax_label} abaixo do contrato",
+                    amount_display=format_signed_brl(shortfall),
+                    risk_amount=shortfall,
+                    suggested_action=(
+                        f"Recolher/glosar diferença de {tax_label} no próximo pagamento"
+                    ),
+                )
+            )
+        else:
+            findings_out.append(
+                AuditFinding(
+                    severity="Baixa",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem=f"Retenção de {tax_label} exige revisão",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action=f"Confirmar alíquota contratual de {tax_label}",
+                )
+            )
+
+    # 4b. Cálculo item a item (qtd × unitário), limite de horas, horas sem OS e valor por extenso
+    for chk in non_dup_issues:
+        if chk.name == ITEMS_ARITHMETIC_CHECK:
+            handled_names.add(ITEMS_ARITHMETIC_CHECK)
+            diff_val = _extract_memory_money(chk, "diferença acumulada nos itens")
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Erro de cálculo no item (qtd × unitário)",
+                    amount_display=format_brl(diff_val) if diff_val is not None else "n/a",
+                    risk_amount=diff_val,
+                    suggested_action="Solicitar correção da NF ou glosar diferença",
+                )
+            )
+        elif chk.name == HOURLY_LIMIT_CHECK:
+            handled_names.add(HOURLY_LIMIT_CHECK)
+            excess_val = _extract_memory_money(chk, "valor excedente")
+            findings_out.append(
+                AuditFinding(
+                    severity="Alta",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Horas cobradas acima do limite contratual",
+                    amount_display=format_brl(excess_val) if excess_val is not None else "n/a",
+                    risk_amount=excess_val,
+                    suggested_action="Glosar horas excedentes ao teto contratual",
+                )
+            )
+        elif chk.name == HOURS_WITHOUT_OS_CHECK:
+            handled_names.add(HOURS_WITHOUT_OS_CHECK)
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Horas cobradas sem Ordem de Serviço (OS)",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Exigir OS ou boletim de medição antes de pagar",
+                )
+            )
+        elif chk.name == "items_total":
+            signed_diff = _extract_signed_memory_money(chk, "diferença = total")
+            if signed_diff is not None and signed_diff > _ZERO:
+                handled_names.add("items_total")
+                findings_out.append(
+                    AuditFinding(
+                        severity="Alta",
+                        invoice_numbers=(invoice.number,),
+                        invoice_ids=(invoice.id,),
+                        competence=comp_pt,
+                        sort_period=sort_p,
+                        sort_number=sort_n,
+                        problem="Total da nota maior que a soma dos itens",
+                        amount_display=format_signed_brl(signed_diff),
+                        risk_amount=signed_diff,
+                        suggested_action="Solicitar correção da NF ou glosar diferença",
+                    )
+                )
+        elif chk.name == WRITTEN_AMOUNT_CHECK:
+            handled_names.add(WRITTEN_AMOUNT_CHECK)
+            findings_out.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=(invoice.number,),
+                    invoice_ids=(invoice.id,),
+                    competence=comp_pt,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem="Valor por extenso diverge do valor numérico",
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Confirmar valor devido e pedir carta de correção",
+                )
+            )
+
+    # 5. Divergência de razão social / natureza jurídica (P-03)
+    for chk in non_dup_issues:
+        if chk.name != SUPPLIER_IDENTITY_CHECK:
+            continue
+        handled_names.add(SUPPLIER_IDENTITY_CHECK)
+        findings_out.append(
+            AuditFinding(
+                severity="Baixa",
+                invoice_numbers=(invoice.number,),
+                invoice_ids=(invoice.id,),
+                competence=comp_pt,
+                sort_period=sort_p,
+                sort_number=sort_n,
+                problem="Razão social / natureza jurídica diverge do contrato",
                 amount_display="n/a",
                 risk_amount=None,
-                suggested_action="Pedir NF corrigida",
+                suggested_action="Conferir alteração contratual e cadastro na Receita Federal",
             )
-        return AuditFinding(
-            severity="Média",
-            invoice_numbers=(invoice.number,),
-            invoice_ids=(invoice.id,),
-            competence=comp_pt,
-            sort_period=sort_p,
-            sort_number=sort_n,
-            problem="Documentação incompleta",
-            amount_display="n/a",
-            risk_amount=None,
-            suggested_action="Solicitar documentação complementar",
         )
 
-    if not non_dup_issues:
-        # Nota entrou somente por duplicate_invoice: já consolidada no agrupamento de duplicidade.
-        return None
+    # 6. Demais checks relevantes ainda não cobertos acima
+    remaining = [chk for chk in non_dup_issues if chk.name not in handled_names]
+    if findings_out or not remaining:
+        return findings_out
 
     ordered_checks = sorted(
-        non_dup_issues,
+        remaining,
         key=lambda chk: (
             0 if chk.result in (CheckResult.PENDING, CheckResult.DIVERGENCE) else 1,
             _CHECK_PRIORITY.get(chk.name, 99),
@@ -369,9 +1063,9 @@ def _classify_non_duplicate_issue(
     cleaned_msg = clean_technical_ids_in_message(primary.message, doc_names)
 
     if primary.name == "contract_validity":
-        problem = "Fora da vigência do contrato"
-        action = "Verificar aditivo de prazo ou glosar"
-        sev: FindingSeverity = "Média"
+        problem = "Competência fora da vigência do contrato"
+        action = "Verificar aditivo de prorrogação ou bloquear pagamento"
+        sev: FindingSeverity = "Alta"
     elif primary.name == "overage_quantity":
         problem = "Excedente sem medição comprovada"
         action = "Exigir boletim de medição"
@@ -392,6 +1086,10 @@ def _classify_non_duplicate_issue(
         problem = "Reajuste contratual a verificar"
         action = "Conferir aplicação do índice"
         sev = "Baixa"
+    elif primary.name == UNAPPROVED_ADJUSTMENT_CHECK:
+        problem = "Descrição alega reajuste sem aditivo"
+        action = "Exigir aditivo formal ou estorno"
+        sev = "Alta"
     elif "pendente" in cleaned_msg.casefold() or "revisada" in cleaned_msg.casefold():
         problem = "Regra contratual aguardando confirmação"
         action = "Confirmar regra em Regras e Vigência"
@@ -401,18 +1099,20 @@ def _classify_non_duplicate_issue(
         action = "Analisar memória de cálculo"
         sev = "Média"
 
-    return AuditFinding(
-        severity=sev,
-        invoice_numbers=(invoice.number,),
-        invoice_ids=(invoice.id,),
-        competence=comp_pt,
-        sort_period=sort_p,
-        sort_number=sort_n,
-        problem=problem,
-        amount_display="n/a",
-        risk_amount=None,
-        suggested_action=action,
-    )
+    return [
+        AuditFinding(
+            severity=sev,
+            invoice_numbers=(invoice.number,),
+            invoice_ids=(invoice.id,),
+            competence=comp_pt,
+            sort_period=sort_p,
+            sort_number=sort_n,
+            problem=problem,
+            amount_display="n/a",
+            risk_amount=None,
+            suggested_action=action,
+        )
+    ]
 
 
 def _semaphore_for_classification(
@@ -425,13 +1125,148 @@ def _semaphore_for_classification(
     return ("bad", "▲", "Divergência")
 
 
+def _apply_safety_lock_per_contract(
+    findings: list[AuditFinding],
+    ordered_items: Sequence[tuple[Invoice, StoredAudit]],
+) -> tuple[list[AuditFinding], list[str]]:
+    """
+    Trava de Segurança: se >= 3 notas de um mesmo contrato tiverem 100% de incidência de
+    um mesmo achado cadastral, consolida numa linha única sem somar o bruto como exposição.
+    """
+    inv_ids_by_contract: dict[str, set[str]] = {}
+    inv_nums_by_id: dict[str, str] = {}
+    inv_contract_by_id: dict[str, str] = {}
+    for inv, _ in ordered_items:
+        cid = inv.contract_id or "__unlinked__"
+        inv_ids_by_contract.setdefault(cid, set()).add(inv.id)
+        inv_nums_by_id[inv.id] = inv.number
+        inv_contract_by_id[inv.id] = cid
+
+    extra_warnings: list[str] = []
+    locked_findings: list[AuditFinding] = list(findings)
+
+    for cid, cid_inv_ids in inv_ids_by_contract.items():
+        if cid == "__unlinked__" or len(cid_inv_ids) < 3:
+            continue
+        for problem_label in sorted(_SAFETY_LOCK_CADASTRO_PROBLEMS):
+            matched_indices: list[int] = []
+            affected_ids: set[str] = set()
+            for idx, f in enumerate(locked_findings):
+                if f.problem != problem_label:
+                    continue
+                if f.invoice_ids and all(iid in cid_inv_ids for iid in f.invoice_ids):
+                    matched_indices.append(idx)
+                    affected_ids.update(f.invoice_ids)
+            if affected_ids != cid_inv_ids or not matched_indices:
+                continue
+            sample = locked_findings[matched_indices[0]]
+            remove_set = set(matched_indices)
+            locked_findings = [f for i, f in enumerate(locked_findings) if i not in remove_set]
+            sorted_nums = tuple(
+                sorted(
+                    (inv_nums_by_id[iid] for iid in cid_inv_ids if iid in inv_nums_by_id),
+                    key=natural_number_sort_tuple,
+                )
+            )
+            sorted_ids = tuple(sorted(cid_inv_ids))
+            locked_findings.append(
+                AuditFinding(
+                    severity="Média",
+                    invoice_numbers=sorted_nums,
+                    invoice_ids=sorted_ids,
+                    competence="Todo o período",
+                    sort_period=sample.sort_period,
+                    sort_number=natural_number_sort_tuple(sorted_nums[0])
+                    if sorted_nums
+                    else sample.sort_number,
+                    problem=(
+                        f"Possível falha na leitura cadastral do contrato {cid} "
+                        "(100% das notas divergiram)"
+                    ),
+                    amount_display="n/a",
+                    risk_amount=None,
+                    suggested_action="Conferir CNPJ e razão social cadastrados no contrato",
+                )
+            )
+            extra_warnings.append(
+                f"Trava de segurança ({cid}): todas as {len(cid_inv_ids)} notas acusaram "
+                f"'{problem_label}' — provável erro de leitura do contrato; exposição zerada "
+                "para evitar falso positivo em cascata."
+            )
+
+    return locked_findings, extra_warnings
+
+
+def _filter_payment_audit_for_contract(
+    payment_audit: PaymentCycleAuditResult | None,
+    contract_id: str,
+    inv_number_keys: set[str],
+) -> PaymentCycleAuditResult | None:
+    if payment_audit is None:
+        return None
+    scoped_findings = tuple(
+        pf
+        for pf in payment_audit.findings
+        if pf.contract_id == contract_id
+        or (
+            pf.contract_id is None
+            and any(num.strip().casefold() in inv_number_keys for num in pf.invoice_numbers)
+        )
+    )
+    scoped_checks = {
+        k: v for k, v in payment_audit.checks_by_invoice_number.items() if k in inv_number_keys
+    }
+    scoped_dups = {
+        k: v for k, v in payment_audit.duplicate_op_pairs.items() if k in inv_number_keys
+    }
+    return PaymentCycleAuditResult(
+        payment_orders_count=(
+            payment_audit.payment_orders_count if scoped_findings or scoped_checks else 0
+        ),
+        certificates_count=payment_audit.certificates_count if scoped_findings else 0,
+        total_net_paid=payment_audit.total_net_paid,
+        checks_by_invoice_number=scoped_checks,
+        findings=scoped_findings,
+        duplicate_op_pairs=scoped_dups,
+    )
+
+
 def build_executive_report(
     audited_items: Sequence[tuple[Invoice, StoredAudit]],
     *,
     doc_names: dict[str, str] | None = None,
+    payment_audit: PaymentCycleAuditResult | None = None,
+    contracts: Sequence[Contract] = (),
+    rules: Sequence[ContractRule] = (),
+    _allow_sections: bool = True,
 ) -> ExecutiveReportSummary:
     """Constrói o Relatório Executivo estruturado por gravidade, competência e exposição."""
     ordered_items = sorted(audited_items, key=lambda pair: natural_invoice_sort_key(pair[0]))
+    inv_by_number = {inv.number.strip().casefold(): inv for inv, _ in ordered_items}
+    inv_totals_by_id = {inv.id: inv.total for inv, _ in ordered_items}
+    op_checks_by_nf = payment_audit.checks_by_invoice_number if payment_audit is not None else {}
+
+    contract_sections: list[ContractSectionReport] = []
+    if _allow_sections and len(contracts) > 1:
+        present_cids = {inv.contract_id for inv, _ in ordered_items if inv.contract_id is not None}
+        if len(present_cids) > 1:
+            contract_by_id = {c.id: c for c in contracts}
+            for cid in sorted(cid for cid in present_cids if cid in contract_by_id):
+                sec_items = [pair for pair in ordered_items if pair[0].contract_id == cid]
+                sec_nf_keys = {inv.number.strip().casefold() for inv, _ in sec_items}
+                sec_rules = [r for r in rules if r.contract_id == cid]
+                sec_payment = _filter_payment_audit_for_contract(payment_audit, cid, sec_nf_keys)
+                sec_summary = build_executive_report(
+                    sec_items,
+                    doc_names=doc_names,
+                    payment_audit=sec_payment,
+                    contracts=(contract_by_id[cid],),
+                    rules=sec_rules,
+                    _allow_sections=False,
+                )
+                contract_sections.append(
+                    ContractSectionReport(contract=contract_by_id[cid], summary=sec_summary)
+                )
 
     findings: list[AuditFinding] = []
     for comp in _group_duplicate_components(ordered_items):
@@ -460,10 +1295,49 @@ def build_executive_report(
         )
 
     for inv, stored in ordered_items:
-        finding = _classify_non_duplicate_issue(inv, stored, doc_names=doc_names)
-        if finding is not None:
-            findings.append(finding)
+        findings.extend(_classify_non_duplicate_issues(inv, stored, doc_names=doc_names))
 
+    payment_risk_total = _ZERO
+    if payment_audit is not None:
+        for pf in payment_audit.findings:
+            inv_ids = tuple(
+                inv_by_number[num.strip().casefold()].id
+                for num in pf.invoice_numbers
+                if num.strip().casefold() in inv_by_number
+            )
+            if pf.competence_period is not None:
+                comp_str = format_competence_pt(pf.competence_period)
+                sort_p = period_sort_tuple(pf.competence_period)
+            else:
+                comp_str = "Período"
+                sort_p = (9999, 99)
+            sort_n = (
+                natural_number_sort_tuple(pf.invoice_numbers[0])
+                if pf.invoice_numbers
+                else (9, 0, pf.code)
+            )
+            if pf.risk_amount is not None:
+                payment_risk_total += pf.risk_amount
+                amt_display = format_brl(pf.risk_amount)
+            else:
+                amt_display = "n/a"
+            findings.append(
+                AuditFinding(
+                    severity=pf.severity,
+                    invoice_numbers=pf.invoice_numbers,
+                    invoice_ids=inv_ids,
+                    competence=comp_str,
+                    sort_period=sort_p,
+                    sort_number=sort_n,
+                    problem=pf.problem,
+                    amount_display=amt_display,
+                    risk_amount=pf.risk_amount,
+                    suggested_action=pf.suggested_action,
+                )
+            )
+
+    findings, safety_warnings = _apply_safety_lock_per_contract(findings, ordered_items)
+    findings = _group_identical_findings(findings)
     findings.sort(
         key=lambda f: (
             _SEVERITY_RANK[f.severity],
@@ -474,6 +1348,19 @@ def build_executive_report(
         )
     )
 
+    max_sev_by_inv: dict[str, FindingSeverity] = {}
+    for f in findings:
+        for iid in f.invoice_ids:
+            cur = max_sev_by_inv.get(iid)
+            if cur is None or _SEVERITY_RANK[f.severity] < _SEVERITY_RANK[cur]:
+                max_sev_by_inv[iid] = f.severity
+
+    op_flagged_numbers = {
+        nf_key
+        for nf_key, chk_list in op_checks_by_nf.items()
+        if any(chk.result is not CheckResult.OK for chk in chk_list)
+    }
+
     clean_items = [
         (inv, stored)
         for inv, stored in ordered_items
@@ -483,24 +1370,16 @@ def build_executive_report(
         (inv, stored)
         for inv, stored in ordered_items
         if stored.result.classification is not AuditClassification.NO_DIVERGENCE
+        or inv.number.strip().casefold() in op_flagged_numbers
     ]
 
     charged_total = sum((stored.result.total for _, stored in ordered_items), _ZERO)
-    has_any_base = any(stored.result.base is not None for _, stored in ordered_items)
-    expected_total: Decimal | None = (
-        sum(
-            (stored.result.base for _, stored in ordered_items if stored.result.base is not None),
-            _ZERO,
-        )
-        if has_any_base
-        else None
-    )
-    exposure_total = sum(
-        (f.risk_amount for f in findings if f.risk_amount is not None),
-        _ZERO,
-    )
+    exposure_total = _compute_exposure_total(findings, inv_totals_by_id)
+    reading_coverage, base_warnings = _build_reading_diagnostics(contracts, rules)
+    reading_warnings = tuple(dict.fromkeys([*base_warnings, *safety_warnings]))
 
-    # Quadro cronológico por competência
+    # Quadro cronológico por competência (uma única base vigente por contrato na competência;
+    # evita comparar valor vigente parcial quando há mais de um contrato no mesmo mês).
     by_period: dict[str, list[tuple[Invoice, StoredAudit]]] = {}
     for pair in ordered_items:
         by_period.setdefault(str(pair[1].result.reference_period), []).append(pair)
@@ -508,22 +1387,38 @@ def build_executive_report(
     competence_rows: list[CompetenceSemaphoreRow] = []
     for period_iso in sorted(by_period.keys(), key=period_sort_tuple):
         bucket = by_period[period_iso]
-        period_has_base = any(st.result.base is not None for _, st in bucket)
-        period_expected = (
-            sum((st.result.base for _, st in bucket if st.result.base is not None), _ZERO)
-            if period_has_base
+        bucket_cids = {inv.contract_id or f"__unlinked_{inv.id}" for inv, _ in bucket}
+        dedup_base_by_contract: dict[str, Decimal] = {}
+        for c_key in bucket_cids:
+            c_bases = [
+                st.result.base
+                for inv, st in bucket
+                if (inv.contract_id or f"__unlinked_{inv.id}") == c_key
+                and st.result.base is not None
+            ]
+            if not c_bases:
+                continue
+            if len(c_bases) == 1 or len(set(c_bases)) == 1:
+                dedup_base_by_contract[c_key] = c_bases[0]
+            else:
+                dedup_base_by_contract[c_key] = sum(c_bases, _ZERO)
+
+        all_contracts_have_base = len(dedup_base_by_contract) == len(bucket_cids)
+        period_expected: Decimal | None = (
+            sum(dedup_base_by_contract.values(), _ZERO)
+            if dedup_base_by_contract and (len(bucket_cids) == 1 or all_contracts_have_base)
             else None
         )
         period_charged = sum((st.result.total for _, st in bucket), _ZERO)
-        period_diff = (
-            sum(
-                (st.result.difference for _, st in bucket if st.result.difference is not None),
-                _ZERO,
-            )
-            if any(st.result.difference is not None for _, st in bucket)
-            else None
+        period_diff: Decimal | None = (
+            period_charged - period_expected if period_expected is not None else None
         )
-        worst = most_severe([st.result.classification for _, st in bucket])
+        classifications_in_month = [st.result.classification for _, st in bucket]
+        if any(inv.number.strip().casefold() in op_flagged_numbers for inv, _ in bucket):
+            classifications_in_month.append(AuditClassification.DIVERGENCE)
+        if period_diff is not None and period_diff > _ZERO:
+            classifications_in_month.append(AuditClassification.DIVERGENCE)
+        worst = most_severe(classifications_in_month)
         tone, icon, status_label = _semaphore_for_classification(worst)
         competence_rows.append(
             CompetenceSemaphoreRow(
@@ -539,6 +1434,15 @@ def build_executive_report(
             )
         )
 
+    expected_total: Decimal | None = (
+        sum(
+            (row.expected_total for row in competence_rows if row.expected_total is not None),
+            _ZERO,
+        )
+        if any(row.expected_total is not None for row in competence_rows)
+        else None
+    )
+
     clean_numbers = tuple(inv.number for inv, _ in clean_items)
     if not clean_numbers:
         clean_summary_line = "Nenhuma nota concluída sem ressalvas neste escopo."
@@ -553,7 +1457,7 @@ def build_executive_report(
             f"sem divergências ({', '.join(clean_numbers)})."
         )
 
-    # Apêndice técnico enxuto exclusivamente para notas com achado (na mesma ordem dos achados)
+    # Apêndice técnico exclusivamente para notas com achado (fiscal, tributário ou na OP vinculada)
     finding_order_by_inv: dict[str, int] = {}
     for idx, f in enumerate(findings):
         for iid in f.invoice_ids:
@@ -569,10 +1473,29 @@ def build_executive_report(
     appendix_entries: list[AppendixEntry] = []
     for inv, stored in flagged_sorted:
         res = stored.result
-        tone, _, cls_label = AUDIT_CLASSIFICATION_BADGES[res.classification]
+        op_checks = op_checks_by_nf.get(inv.number.strip().casefold(), ())
+        combined_cls = most_severe(
+            [
+                res.classification,
+                *(
+                    chk.result.classification
+                    for chk in op_checks
+                    if chk.result is not CheckResult.OK
+                ),
+            ]
+        )
+        tone, _, cls_label = AUDIT_CLASSIFICATION_BADGES[combined_cls]
+        aligned_sev = max_sev_by_inv.get(inv.id)
+        if aligned_sev is not None:
+            tone = "bad" if aligned_sev == "Alta" else ("ai" if aligned_sev == "Média" else "info")
         check_items: list[AppendixCheckItem] = []
-        for chk in res.checks:
-            if chk.result is CheckResult.OK:
+        for chk in (*res.checks, *op_checks):
+            if chk.result is CheckResult.OK and chk.name != "monthly_price":
+                continue
+            if (
+                chk.result is CheckResult.OK
+                and res.classification is not AuditClassification.MISSING_DOCUMENTATION
+            ):
                 continue
             chk_tone, _, chk_status = CHECK_RESULT_BADGES[chk.result]
             check_items.append(
@@ -613,6 +1536,7 @@ def build_executive_report(
                 supplier=inv.supplier,
                 classification_label=cls_label,
                 tone=tone,
+                severity_label=aligned_sev,
                 expected_display=format_brl(res.base),
                 charged_display=format_brl(res.total),
                 difference_display=format_signed_brl(res.difference),
@@ -643,10 +1567,12 @@ def build_executive_report(
         baixa_count = sum(1 for f in findings if f.severity == "Baixa")
         verdict_tone = "bad" if alta_count > 0 else "ai"
         nota_word = "nota auditada" if total_count == 1 else "notas auditadas"
-        acao_word = "exige ação" if findings_count == 1 else "exigem ação"
+        acao_nota_word = "nota exige ação" if action_invoices_count == 1 else "notas exigem ação"
+        achado_word = "achado" if findings_count == 1 else "achados"
         verdict_headline = (
-            f"{total_count} {nota_word}, {findings_count} {acao_word}, "
-            f"exposição estimada de {format_brl(exposure_total)}."
+            f"{total_count} {nota_word}, {action_invoices_count} {acao_nota_word} "
+            f"({findings_count} {achado_word}), exposição estimada de "
+            f"{format_brl(exposure_total)}."
         )
         sev_parts: list[str] = []
         if alta_count:
@@ -655,13 +1581,34 @@ def build_executive_report(
             sev_parts.append(f"{media_count} de gravidade Média")
         if baixa_count:
             sev_parts.append(f"{baixa_count} de gravidade Baixa")
+        retention_risk = sum(
+            (
+                f.risk_amount
+                for f in findings
+                if f.risk_amount is not None and "retenção" in f.problem.casefold()
+            ),
+            _ZERO,
+        )
+        if expected_total is not None and charged_total > expected_total:
+            billing_excess = charged_total - expected_total
+            totals_line = (
+                f"Faturado {format_brl(charged_total)} contra {format_brl(expected_total)} "
+                f"vigente ({format_signed_brl(billing_excess)}); "
+                f"retenções/pagamentos em risco: {format_brl(payment_risk_total + retention_risk)}."
+            )
+        else:
+            totals_line = f"Total cobrado no escopo: {format_brl(charged_total)}."
         verdict_lines = (
             f"Prioridades identificadas: {', '.join(sev_parts)}.",
             (
                 f"Notas com achado: {action_invoices_count} de {total_count} "
+                f"({clean_count} sem divergências de faturamento)."
+                if payment_audit
+                and (payment_audit.payment_orders_count or payment_audit.certificates_count)
+                else f"Notas com achado: {action_invoices_count} de {total_count} "
                 f"({clean_count} sem divergências)."
             ),
-            f"Total cobrado no escopo: {format_brl(charged_total)}.",
+            totals_line,
             "Recomendação: tratar os achados abaixo antes de liberar o pagamento.",
         )
 
@@ -681,6 +1628,9 @@ def build_executive_report(
         competence_rows=tuple(competence_rows),
         clean_summary_line=clean_summary_line,
         appendix_entries=tuple(appendix_entries),
+        reading_coverage=reading_coverage,
+        reading_warnings=reading_warnings,
+        contract_sections=tuple(contract_sections),
     )
 
 
@@ -782,6 +1732,7 @@ def build_printable_report_html(
             f"<div><strong>Nota {_esc(entry.invoice_number)}</strong> • "
             f"{_esc(entry.competence_pt)} • {_esc(entry.supplier)}</div>"
             f'<span class="pill" style="background:{bg};border-color:{bd};color:{tx};">'
+            f"{_esc(entry.severity_label + ' • ') if entry.severity_label else ''}"
             f"{_esc(entry.classification_label)}</span>"
             "</div>"
             '<div class="app-nums">'
@@ -804,6 +1755,64 @@ def build_printable_report_html(
     )
 
     verdict_items = "".join(f"<li>{_esc(line)}</li>" for line in summary.verdict_lines[:4])
+    coverage_pills_html = "".join(
+        (
+            '<span class="pill" style="'
+            f"background:{(_tone_palette('ok' if item.ok else 'ai', palette))[0]};"
+            f"border-color:{(_tone_palette('ok' if item.ok else 'ai', palette))[1]};"
+            f"color:{(_tone_palette('ok' if item.ok else 'ai', palette))[2]};"
+            'margin:2px 4px 2px 0;">'
+            f"{'✓' if item.ok else '▲'} {_esc(item.label)}: {_esc(item.detail)}</span>"
+        )
+        for item in summary.reading_coverage
+    )
+    coverage_warns_html = "".join(
+        f'<div style="margin-top:4px;font-size:11.5px;color:{palette["gold-text"]};">'
+        f"▲ {_esc(warn)}</div>"
+        for warn in summary.reading_warnings
+    )
+    coverage_section_html = (
+        ""
+        if not summary.reading_coverage and not summary.reading_warnings
+        else (
+            '<div style="border:1px solid '
+            f'{palette["border"]};border-radius:4px;padding:8px 12px;margin-bottom:12px;">'
+            '<div style="font-size:10.5px;font-weight:700;text-transform:uppercase;'
+            f'color:{palette["text-secondary"]};margin-bottom:4px;">'
+            "Cobertura da Leitura do Contrato</div>"
+            f"<div>{coverage_pills_html}</div>"
+            f"{coverage_warns_html}"
+            "</div>"
+        )
+    )
+    sections_html = ""
+    if len(summary.contract_sections) > 1:
+        parts: list[str] = []
+        for sec in summary.contract_sections:
+            sec_s = sec.summary
+            sec_comp = "".join(
+                "<tr>"
+                f'<td class="mono">{_esc(r.competence_pt)}</td>'
+                f'<td class="mono num">{r.invoices_count}</td>'
+                f'<td class="mono num">{_esc(format_brl(r.expected_total))}</td>'
+                f'<td class="mono num">{_esc(format_brl(r.charged_total))}</td>'
+                f'<td class="mono num">{_esc(format_signed_brl(r.difference_total))}</td>'
+                f"<td>{_esc(r.status_label)}</td>"
+                "</tr>"
+                for r in sec_s.competence_rows
+            )
+            parts.append(
+                f"<h2>Contrato {_esc(sec.contract.id)} — {_esc(sec.contract.supplier)} "
+                f"({_esc(sec.contract.supplier_cnpj)})</h2>"
+                f"<p><strong>{_esc(sec_s.verdict_headline)}</strong></p>"
+                '<table><thead><tr><th>Competência</th><th class="num">Notas</th>'
+                '<th class="num">Valor vigente</th><th class="num">Valor cobrado</th>'
+                '<th class="num">Diferença</th><th>Situação</th></tr></thead>'
+                f"<tbody>{sec_comp}</tbody></table>"
+                f'<div class="clean-box">✓ {_esc(sec_s.clean_summary_line)}</div>'
+            )
+        sections_html = "".join(parts)
+
     print_script = (
         '<script>window.addEventListener("load", function () {'
         "setTimeout(function () { window.print(); }, 250);"
@@ -957,6 +1966,8 @@ def build_printable_report_html(
     <ul>{verdict_items}</ul>
   </div>
 
+  {coverage_section_html}
+
   <h2>Achados Priorizados por Gravidade</h2>
   <table>
     <thead>
@@ -988,6 +1999,8 @@ def build_printable_report_html(
   </table>
 
   <div class="clean-box">✓ {_esc(summary.clean_summary_line)}</div>
+
+  {sections_html}
 
   {appendix_section}
 

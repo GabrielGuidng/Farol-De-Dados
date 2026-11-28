@@ -4,14 +4,17 @@ import calendar
 import re
 import sqlite3
 from contextlib import closing
-from datetime import date, datetime
-from decimal import InvalidOperation
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 from pydantic import ValidationError
 
 from backend.api import (
+    AUTO_APPROVE_USER,
     audit_stored_invoice,
     fetch_amendments,
     fetch_audits,
@@ -25,9 +28,15 @@ from backend.api import (
     register_amendment,
     review_rule,
 )
-from backend.motor import SelectionStatus
+from backend.motor import (
+    ReasonCode,
+    SelectionStatus,
+    select_applicable_item_rules,
+    select_applicable_rule,
+)
 from backend.schemas import (
     Amendment,
+    Contract,
     ContractRule,
     Document,
     DocumentType,
@@ -59,12 +68,15 @@ from frontend.ui.formatting import (
     RULE_RELATION_SHORT_LABELS,
     RULE_TYPE_LABELS,
     SELECTION_STATUS_BADGES,
+    format_brl,
     format_compact_validity,
+    format_competence_pt,
     format_confidence_pct,
     format_date_br,
     format_validity_br,
     parse_decimal_input,
 )
+from frontend.ui.tokens import CHART_COLORS, THEMES, ThemeName
 
 _DEFAULT_RULE_CONFIRM_JUST = "Regra confirmada na conferência documental."
 _DIALOG_DECISION_LABELS: dict[ReviewDecision, str] = {
@@ -156,6 +168,7 @@ def _build_corrected_rule(
     start_raw: str,
     end_raw: str,
     clause_raw: str,
+    quantity_raw: str | None = None,
 ) -> ContractRule:
     """Constrói cópia corrigida de `ContractRule` preservando tipagem Decimal e validação."""
     start_date = _parse_flexible_validity_date(start_raw, is_end=False)
@@ -164,9 +177,16 @@ def _build_corrected_rule(
     stripped = value_raw.strip()
     updates: dict[str, object] = {}
     if stripped:
-        if rule.rule_type in (RuleType.MONTHLY_PRICE, RuleType.OVERAGE_PRICE):
+        if rule.rule_type in (
+            RuleType.MONTHLY_PRICE,
+            RuleType.ITEM_PRICE,
+            RuleType.OVERAGE_PRICE,
+            RuleType.INSS_RETENTION,
+            RuleType.ISS_RETENTION,
+            RuleType.APPROVAL_LIMIT,
+        ):
             updates["value"] = parse_decimal_input(stripped)
-        elif rule.rule_type is RuleType.FRANCHISE:
+        elif rule.rule_type in (RuleType.FRANCHISE, RuleType.PAYMENT_TERMS):
             updates["quantity"] = parse_decimal_input(stripped)
         elif rule.rule_type is RuleType.ADJUSTMENT:
             updates["adjustment_index"] = stripped
@@ -174,6 +194,10 @@ def _build_corrected_rule(
             initial_param = _format_date_for_dialog(rule.validity.end, is_end=True)
             if not end_raw.strip() or stripped != initial_param:
                 end_date = _parse_flexible_validity_date(stripped, is_end=True)
+
+    if rule.rule_type is RuleType.ITEM_PRICE and quantity_raw is not None:
+        clean_qty = quantity_raw.strip()
+        updates["quantity"] = parse_decimal_input(clean_qty) if clean_qty else None
 
     updates["validity"] = ValidityPeriod(start=start_date, end=end_date)
 
@@ -192,11 +216,19 @@ def _build_corrected_rule(
 
 def _initial_param_input(rule: ContractRule) -> str:
     if (
-        rule.rule_type in (RuleType.MONTHLY_PRICE, RuleType.OVERAGE_PRICE)
+        rule.rule_type
+        in (
+            RuleType.MONTHLY_PRICE,
+            RuleType.ITEM_PRICE,
+            RuleType.OVERAGE_PRICE,
+            RuleType.INSS_RETENTION,
+            RuleType.ISS_RETENTION,
+            RuleType.APPROVAL_LIMIT,
+        )
         and rule.value is not None
     ):
         return f"{rule.value:.2f}".replace(".", ",")
-    if rule.rule_type is RuleType.FRANCHISE and rule.quantity is not None:
+    if rule.rule_type in (RuleType.FRANCHISE, RuleType.PAYMENT_TERMS) and rule.quantity is not None:
         return str(rule.quantity).replace(".", ",")
     if rule.rule_type is RuleType.ADJUSTMENT and rule.adjustment_index is not None:
         return rule.adjustment_index
@@ -223,6 +255,15 @@ def _open_rule_correction_dialog(
             value=_initial_param_input(rule),
             key=f"corr_val_{rule.id}",
         )
+        quantity_raw: str | None = None
+        if rule.rule_type is RuleType.ITEM_PRICE:
+            qty_default = str(rule.quantity).replace(".", ",") if rule.quantity is not None else ""
+            quantity_raw = st.text_input(
+                "Quantidade contratada / máxima",
+                value=qty_default,
+                placeholder="Ex.: 14",
+                key=f"corr_qty_{rule.id}",
+            )
         c_ini, c_fim = st.columns(2, gap="medium")
         with c_ini:
             start_raw = st.text_input(
@@ -284,6 +325,7 @@ def _open_rule_correction_dialog(
                             start_raw=start_raw,
                             end_raw=end_raw,
                             clause_raw=clause_raw,
+                            quantity_raw=quantity_raw,
                         )
                         if chosen_decision is ReviewDecision.CORRECT
                         else None
@@ -315,6 +357,7 @@ def _rule_compact_row_html(
     *,
     source_doc: Document | None,
     previous_value_hint: str | None,
+    is_auto_approved: bool = False,
 ) -> str:
     doc_name = source_doc.file_name if source_doc else "Documento de origem"
     page_txt = f"pág. {rule.evidence.page}" if rule.evidence.page is not None else "sem pág."
@@ -343,8 +386,13 @@ def _rule_compact_row_html(
         else ""
     )
 
-    rev_tone, rev_icon, rev_label = REVIEW_STATUS_BADGES[rule.review_status]
-    rev_badge = render_badge(rev_tone, rev_icon, rev_label)
+    if is_auto_approved and rule.review_status is ReviewStatus.CONFIRMED:
+        rev_badge = render_badge("ok", "✓", "Aprovada (auto)")
+        auto_hint = '<div class="compact-rule-sub">Confiança &gt; 85% • editável</div>'
+    else:
+        rev_tone, rev_icon, rev_label = REVIEW_STATUS_BADGES[rule.review_status]
+        rev_badge = render_badge(rev_tone, rev_icon, rev_label)
+        auto_hint = ""
     conf_txt = format_confidence_pct(rule.verification_score)
 
     missing_start_hint = (
@@ -371,7 +419,7 @@ def _rule_compact_row_html(
         f'<div class="compact-rule-excerpt">“{escape_text(rule.evidence.literal_excerpt)}”</div>'
         "</div>"
         f'<div class="mono-value">{escape_text(conf_txt)}</div>'
-        f"<div>{rev_badge}</div>"
+        f"<div>{rev_badge}{auto_hint}</div>"
         "</div>"
     )
 
@@ -384,6 +432,7 @@ def _render_rule_review_tab(
     doc_by_id: dict[str, Document],
     amendments: tuple[Amendment, ...],
     reviewer: str,
+    auto_approved_ids: set[str] | None = None,
 ) -> None:
     pending_rules = [r for r in rules if not r.review_status.is_trusted]
     trusted_rules = [r for r in rules if r.review_status.is_trusted]
@@ -400,6 +449,18 @@ def _render_rule_review_tab(
             KpiItem("Aditivos por revisar", str(len(pending_amendments))),
         ]
     )
+
+    auto_ids = auto_approved_ids or set()
+    if auto_ids:
+        render_banner(
+            "info",
+            "Regras aprovadas automaticamente (confiança > 85%)",
+            (
+                f"{len(auto_ids)} regra(s) foram confirmadas automaticamente por atingirem "
+                "confiança acima de 85% na verificação documental. Caso queira alterar alguma, "
+                "clique em Corrigir ou Rejeitar na linha correspondente."
+            ),
+        )
 
     h_left, h_mid, h_right = st.columns([2.2, 1.4, 1.3], gap="small", vertical_alignment="center")
     with h_left:
@@ -500,6 +561,7 @@ def _render_rule_review_tab(
                         rule,
                         source_doc=source_doc,
                         previous_value_hint=prev_hint_by_new_id.get(rule.id),
+                        is_auto_approved=rule.id in auto_ids,
                     )
                 )
             with col_act:
@@ -696,6 +758,282 @@ def _render_rule_review_tab(
                                 st.rerun()
 
 
+def _iter_reference_periods(
+    start_period: ReferencePeriod,
+    end_period: ReferencePeriod,
+    *,
+    max_months: int = 36,
+) -> list[ReferencePeriod]:
+    periods: list[ReferencePeriod] = []
+    year, month = start_period.year, start_period.month
+    while (year, month) <= (end_period.year, end_period.month) and len(periods) < max_months:
+        periods.append(ReferencePeriod(year=year, month=month))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return periods
+
+
+def _active_price_rules_for_month(
+    item_rules: list[ContractRule],
+    monthly_rules: list[ContractRule],
+    period: ReferencePeriod,
+) -> tuple[Decimal | None, tuple[ContractRule, ...]]:
+    if item_rules:
+        sels = select_applicable_item_rules(item_rules, period)
+        selected_rules: list[ContractRule] = []
+        for item_key, sel in sels.items():
+            if sel.status is SelectionStatus.SELECTED and sel.rule is not None:
+                selected_rules.append(sel.rule)
+            elif sel.status is SelectionStatus.NEEDS_REVIEW and all(
+                r.code is ReasonCode.MID_PERIOD_CHANGE for r in sel.reasons
+            ):
+                matching = [
+                    r
+                    for r in item_rules
+                    if r.validity.start is not None
+                    and r.validity.start <= period.last_day
+                    and (r.validity.end is None or r.validity.end >= period.first_day)
+                    and " ".join((r.item_name or "").casefold().split())
+                    == " ".join(item_key.split())
+                ]
+                if not matching:
+                    mid_ids = {rid for reason in sel.reasons for rid in reason.rule_ids}
+                    matching = [r for r in item_rules if r.id in mid_ids]
+                if matching:
+                    selected_rules.append(
+                        max(matching, key=lambda r: (r.validity.start or date.min, r.version))
+                    )
+        if selected_rules:
+            total = sum(
+                (r.value * r.quantity for r in selected_rules if r.value and r.quantity),
+                Decimal("0.00"),
+            )
+            return total, tuple(selected_rules)
+
+    if monthly_rules:
+        sel_m = select_applicable_rule(monthly_rules, period)
+        if sel_m.status is SelectionStatus.SELECTED and sel_m.rule is not None:
+            return sel_m.rule.value, (sel_m.rule,)
+        if sel_m.status is SelectionStatus.NEEDS_REVIEW and all(
+            r.code is ReasonCode.MID_PERIOD_CHANGE for r in sel_m.reasons
+        ):
+            mid_ids = {rid for reason in sel_m.reasons for rid in reason.rule_ids}
+            cands = [r for r in monthly_rules if r.id in mid_ids]
+            if cands:
+                picked = max(cands, key=lambda r: (r.validity.start or date.min, r.version))
+                return picked.value, (picked,)
+
+    return None, ()
+
+
+def _build_vigencia_timeline_chart(
+    contract: Contract | None,
+    timeline_rules: tuple[ContractRule, ...],
+    selected_period: ReferencePeriod,
+    doc_by_id: dict[str, Document],
+    theme: ThemeName,
+) -> alt.Chart | alt.LayerChart | None:
+    """Constrói gráfico em linha em degrau com evolução mensal da vigência e marcos de aditivos."""
+    item_rules = [
+        r
+        for r in timeline_rules
+        if r.rule_type is RuleType.ITEM_PRICE
+        and r.review_status is not ReviewStatus.REJECTED
+        and r.quantity_scope in (None, "MONTHLY")
+        and r.value is not None
+        and r.quantity is not None
+    ]
+    monthly_rules = [
+        r
+        for r in timeline_rules
+        if r.rule_type is RuleType.MONTHLY_PRICE
+        and r.review_status is not ReviewStatus.REJECTED
+        and r.value is not None
+    ]
+    price_rules = [*item_rules, *monthly_rules]
+    if not price_rules:
+        return None
+
+    starts = [
+        d
+        for d in (
+            contract.validity.start if contract is not None else None,
+            *(r.validity.start for r in price_rules),
+        )
+        if d is not None
+    ]
+    if not starts:
+        return None
+    min_start = min(starts)
+
+    ext_ends = [
+        r.validity.end
+        for r in timeline_rules
+        if r.rule_type is RuleType.EXTENSION
+        and r.review_status.is_trusted
+        and r.validity.end is not None
+    ]
+    end_candidates = [
+        d
+        for d in (
+            contract.validity.end if contract is not None else None,
+            *ext_ends,
+            *(r.validity.end for r in price_rules),
+            selected_period.last_day,
+        )
+        if d is not None
+    ]
+    rule_starts = [r.validity.start for r in price_rules if r.validity.start is not None]
+    max_end = (
+        max(end_candidates)
+        if end_candidates
+        else (max(rule_starts) + timedelta(days=150) if rule_starts else selected_period.last_day)
+    )
+    start_period = ReferencePeriod(year=min_start.year, month=min_start.month)
+    end_period = ReferencePeriod(year=max_end.year, month=max_end.month)
+    periods = _iter_reference_periods(start_period, end_period)
+
+    rows: list[dict[str, object]] = []
+    milestones: list[dict[str, object]] = []
+    prev_sig: tuple[tuple[str, int], ...] | None = None
+
+    for period in periods:
+        total_val, active = _active_price_rules_for_month(item_rules, monthly_rules, period)
+        if total_val is None or not active:
+            continue
+        sig = tuple(sorted((r.id, r.version) for r in active))
+        comp_pt = format_competence_pt(period)
+        origin_docs = ", ".join(
+            dict.fromkeys(
+                doc_by_id[r.evidence.source_document_id].file_name
+                if r.evidence.source_document_id in doc_by_id
+                else r.evidence.source_document_id
+                for r in active
+            )
+        )
+        max_ver = max(r.version for r in active)
+        marco = "Contrato-Base" if max_ver == 1 else f"Vigência v{max_ver}"
+        rows.append(
+            {
+                "competencia": comp_pt,
+                "valor": float(total_val),
+                "valor_brl": format_brl(total_val),
+                "marco": marco,
+                "origem": origin_docs,
+                "selecionada": period == selected_period,
+            }
+        )
+        if prev_sig is not None and sig != prev_sig:
+            milestones.append(
+                {
+                    "competencia": comp_pt,
+                    "evento": f"Início {marco}: {format_brl(total_val)}",
+                }
+            )
+        prev_sig = sig
+
+    if not rows:
+        return None
+
+    palette = THEMES[theme]
+    series_colors = CHART_COLORS[theme]
+    ordered_periods = [str(r["competencia"]) for r in rows]
+    df = pd.DataFrame(rows)
+    distinct_vals = {r["valor"] for r in rows}
+    zero_scale = len(distinct_vals) <= 1
+
+    layers: list[alt.Chart] = [
+        alt.Chart(df)
+        .mark_line(
+            interpolate="step-after",
+            strokeWidth=2.5,
+            color=series_colors[0],
+            point=alt.OverlayMarkDef(filled=True, size=65, color=series_colors[0]),
+        )
+        .encode(
+            x=alt.X(
+                "competencia:N",
+                sort=ordered_periods,
+                title="Competência (Linha do Tempo)",
+            ),
+            y=alt.Y(
+                "valor:Q",
+                title="Valor contratual vigente (R$)",
+                scale=alt.Scale(zero=zero_scale),
+            ),
+            tooltip=[
+                alt.Tooltip("competencia:N", title="Competência"),
+                alt.Tooltip("valor_brl:N", title="Valor vigente"),
+                alt.Tooltip("marco:N", title="Marco contratual"),
+                alt.Tooltip("origem:N", title="Documento de origem"),
+            ],
+        )
+    ]
+
+    if milestones:
+        df_ms = pd.DataFrame(milestones)
+        layers.append(
+            alt.Chart(df_ms)
+            .mark_rule(
+                strokeDash=[4, 4],
+                strokeWidth=1.5,
+                color=series_colors[2],
+            )
+            .encode(
+                x=alt.X("competencia:N", sort=ordered_periods),
+                tooltip=[
+                    alt.Tooltip("competencia:N", title="Transição em"),
+                    alt.Tooltip("evento:N", title="Evento"),
+                ],
+            )
+        )
+
+    selected_rows = [r for r in rows if bool(r["selecionada"])]
+    if selected_rows:
+        df_sel = pd.DataFrame(selected_rows)
+        layers.append(
+            alt.Chart(df_sel)
+            .mark_circle(
+                size=160,
+                opacity=0.95,
+                color=series_colors[3],
+                stroke=palette["primary"],
+                strokeWidth=2,
+            )
+            .encode(
+                x=alt.X("competencia:N", sort=ordered_periods),
+                y=alt.Y("valor:Q"),
+                tooltip=[
+                    alt.Tooltip("competencia:N", title="Competência consultada"),
+                    alt.Tooltip("valor_brl:N", title="Valor vigente"),
+                    alt.Tooltip("marco:N", title="Marco contratual"),
+                ],
+            )
+        )
+
+    combined: alt.Chart | alt.LayerChart = (
+        layers[0] if len(layers) == 1 else alt.layer(*layers)
+    ).properties(
+        title="Linha do tempo: Evolução do valor contratual vigente",
+        height=230,
+    )
+    return (
+        combined.properties(usermeta={"embedOptions": {"actions": False}})
+        .configure(background=palette["bg-surface"])
+        .configure_view(stroke=palette["border"], strokeWidth=1)
+        .configure_axis(
+            labelColor=palette["text-secondary"],
+            titleColor=palette["text-secondary"],
+            gridColor=palette["border"],
+            domainColor=palette["border"],
+            tickColor=palette["border"],
+        )
+        .configure_title(color=palette["text-primary"])
+    )
+
+
 def _render_timeline_html(
     timeline_rules: tuple[ContractRule, ...],
     selected_ids: set[str],
@@ -741,6 +1079,7 @@ def _render_competence_tab(
     *,
     contract_id: str,
     doc_by_id: dict[str, Document],
+    contract: Contract | None = None,
 ) -> None:
     st.subheader("Consulta de regras vigentes por competência")
     c_period, c_hint = st.columns([1.0, 2.2], vertical_alignment="bottom")
@@ -785,6 +1124,27 @@ def _render_competence_tab(
         for sel in result.selections.values()
         if sel.status is SelectionStatus.SELECTED and sel.rule is not None
     }
+    raw_theme = st.session_state.get("theme", "dark")
+    active_theme: ThemeName = "light" if raw_theme == "light" else "dark"
+    active_contract = contract if contract is not None else fetch_contract(conn, contract_id)
+    vig_chart = _build_vigencia_timeline_chart(
+        active_contract,
+        result.timeline.rules,
+        period,
+        doc_by_id,
+        active_theme,
+    )
+    if vig_chart is not None:
+        st.altair_chart(
+            vig_chart,
+            theme=None,
+            width="stretch",
+            alt=(
+                "Gráfico em linha da evolução do valor contratual vigente ao longo da linha do "
+                "tempo"
+            ),
+            key="chart_vigencia_timeline",
+        )
     st.html(_render_timeline_html(result.timeline.rules, selected_ids, doc_by_id, str(period)))
 
     st.markdown(f"#### Regras aplicáveis em `{period}`")
@@ -879,6 +1239,16 @@ def render_rules_vigencia_view(conn: sqlite3.Connection) -> None:
     documents = fetch_documents(conn, contract.id)
     doc_by_id = {doc.id: doc for doc in documents}
     amendments = fetch_amendments(conn, contract.id)
+    rule_reviews = fetch_reviews(conn, target_type=ReviewTargetType.RULE)
+    latest_review_user: dict[str, str] = {}
+    for rev in rule_reviews:
+        latest_review_user[rev.target_id] = rev.user
+    auto_approved_ids = {
+        r.id
+        for r in rules
+        if r.review_status is ReviewStatus.CONFIRMED
+        and latest_review_user.get(r.id) == AUTO_APPROVE_USER
+    }
     reviewer = (
         str(st.session_state.get("reviewer_name", "auditor.local")).strip() or "auditor.local"
     )
@@ -892,10 +1262,12 @@ def render_rules_vigencia_view(conn: sqlite3.Connection) -> None:
             doc_by_id=doc_by_id,
             amendments=amendments,
             reviewer=reviewer,
+            auto_approved_ids=auto_approved_ids,
         )
     with tab_competence:
         _render_competence_tab(
             conn,
             contract_id=contract.id,
             doc_by_id=doc_by_id,
+            contract=contract,
         )

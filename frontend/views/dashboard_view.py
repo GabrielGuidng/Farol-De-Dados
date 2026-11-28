@@ -12,8 +12,10 @@ from backend.api import (
     audit_stored_invoice,
     fetch_audits,
     fetch_contract,
+    fetch_contracts,
     fetch_documents,
     fetch_invoices,
+    fetch_payment_cycle_audit,
     fetch_reviews,
     fetch_rules,
 )
@@ -62,7 +64,10 @@ def _active_theme_name() -> ThemeName:
     return "light" if raw == "light" else "dark"
 
 
-def _apply_chart_theme(chart: alt.Chart, palette: dict[str, str]) -> alt.Chart:
+def _apply_chart_theme(
+    chart: alt.Chart | alt.LayerChart,
+    palette: dict[str, str],
+) -> alt.Chart | alt.LayerChart:
     return (
         chart.properties(usermeta={"embedOptions": {"actions": False}})
         .configure(background=palette["bg-surface"])
@@ -126,41 +131,83 @@ def _build_classification_chart(
 def _build_competence_chart(
     rows: tuple[CompetenceSemaphoreRow, ...],
     theme: ThemeName,
-) -> alt.Chart:
+) -> alt.Chart | alt.LayerChart:
     palette = THEMES[theme]
     series_colors = CHART_COLORS[theme]
     ordered_periods = [row.competence_pt for row in rows]
-    records: list[dict[str, object]] = []
+    line_records: list[dict[str, object]] = []
+    div_records: list[dict[str, object]] = []
+
     for row in rows:
         diff_txt = format_signed_brl(row.difference_total)
-        exp_val = row.expected_total if row.expected_total is not None else _ZERO
-        records.append(
-            {
-                "competencia": row.competence_pt,
-                "serie": "Valor vigente",
-                "valor": float(exp_val),
-                "valor_brl": format_brl(row.expected_total),
-                "diferenca_brl": diff_txt,
-            }
-        )
-        records.append(
+        charged_val = float(row.charged_total)
+        if row.expected_total is not None:
+            line_records.append(
+                {
+                    "competencia": row.competence_pt,
+                    "serie": "Valor vigente",
+                    "valor": float(row.expected_total),
+                    "valor_brl": format_brl(row.expected_total),
+                    "diferenca_brl": diff_txt,
+                    "situacao": row.status_label,
+                }
+            )
+        line_records.append(
             {
                 "competencia": row.competence_pt,
                 "serie": "Valor cobrado",
-                "valor": float(row.charged_total),
+                "valor": charged_val,
                 "valor_brl": format_brl(row.charged_total),
                 "diferenca_brl": diff_txt,
+                "situacao": row.status_label,
             }
         )
+        has_div = row.tone == "bad" or (
+            row.difference_total is not None
+            and row.difference_total != _ZERO
+            and row.expected_total is not None
+        )
+        if has_div:
+            div_records.append(
+                {
+                    "competencia": row.competence_pt,
+                    "valor": charged_val,
+                    "valor_brl": format_brl(row.charged_total),
+                    "diferenca_brl": diff_txt,
+                    "situacao": row.status_label,
+                }
+            )
 
-    df = pd.DataFrame(records)
-    chart = (
-        alt.Chart(df)
-        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+    df_lines = (
+        pd.DataFrame(line_records)
+        if line_records
+        else pd.DataFrame(
+            {
+                "competencia": pd.Series(dtype="str"),
+                "serie": pd.Series(dtype="str"),
+                "valor": pd.Series(dtype="float"),
+                "valor_brl": pd.Series(dtype="str"),
+                "diferenca_brl": pd.Series(dtype="str"),
+                "situacao": pd.Series(dtype="str"),
+            }
+        )
+    )
+    distinct_vals = {rec["valor"] for rec in line_records}
+    zero_scale = len(distinct_vals) <= 1
+
+    base_lines = (
+        alt.Chart(df_lines)
+        .mark_line(
+            strokeWidth=2.5,
+            point=alt.OverlayMarkDef(filled=True, size=64),
+        )
         .encode(
-            x=alt.X("competencia:N", sort=ordered_periods, title="Competência"),
-            xOffset="serie:N",
-            y=alt.Y("valor:Q", title="Valor (R$)"),
+            x=alt.X(
+                "competencia:N",
+                sort=ordered_periods,
+                title="Competência (Linha do Tempo)",
+            ),
+            y=alt.Y("valor:Q", title="Valor (R$)", scale=alt.Scale(zero=zero_scale)),
             color=alt.Color(
                 "serie:N",
                 title="Série",
@@ -169,15 +216,55 @@ def _build_competence_chart(
                     range=[series_colors[0], series_colors[1]],
                 ),
             ),
+            strokeDash=alt.StrokeDash(
+                "serie:N",
+                title="Série",
+                scale=alt.Scale(
+                    domain=["Valor vigente", "Valor cobrado"],
+                    range=[[1, 0], [6, 3]],
+                ),
+            ),
             tooltip=[
                 alt.Tooltip("competencia:N", title="Competência"),
                 alt.Tooltip("serie:N", title="Série"),
                 alt.Tooltip("valor_brl:N", title="Valor"),
                 alt.Tooltip("diferenca_brl:N", title="Diferença no mês"),
+                alt.Tooltip("situacao:N", title="Situação"),
             ],
         )
-        .properties(title="Valor vigente × Valor cobrado por competência", height=230)
     )
+
+    if div_records:
+        df_div = pd.DataFrame(div_records)
+        div_points = (
+            alt.Chart(df_div)
+            .mark_circle(
+                size=155,
+                opacity=0.95,
+                color=palette["bad-tx"],
+                stroke=palette["bg-surface"],
+                strokeWidth=1.5,
+            )
+            .encode(
+                x=alt.X("competencia:N", sort=ordered_periods),
+                y=alt.Y("valor:Q"),
+                tooltip=[
+                    alt.Tooltip("competencia:N", title="Competência (atenção)"),
+                    alt.Tooltip("valor_brl:N", title="Valor cobrado"),
+                    alt.Tooltip("diferenca_brl:N", title="Diferença no mês"),
+                    alt.Tooltip("situacao:N", title="Situação"),
+                ],
+            )
+        )
+        chart: alt.Chart | alt.LayerChart = alt.layer(base_lines, div_points).properties(
+            title="Linha do tempo: Valor vigente × Valor cobrado",
+            height=245,
+        )
+    else:
+        chart = base_lines.properties(
+            title="Linha do tempo: Valor vigente × Valor cobrado",
+            height=245,
+        )
     return _apply_chart_theme(chart, palette)
 
 
@@ -320,6 +407,25 @@ def _render_executive_report_section(
         "</div>"
     )
 
+    # 1b. Cobertura da leitura do contrato (um aviso único por dado não lido)
+    if summary.reading_coverage:
+        cov_badges = " ".join(
+            render_badge(
+                "ok" if item.ok else "ai",
+                "✓" if item.ok else "▲",
+                f"{item.label}: {item.detail}",
+            )
+            for item in summary.reading_coverage
+        )
+        st.html(
+            '<div style="margin:6px 0 10px 0;">'
+            '<span class="compact-rule-sub" style="margin-right:8px;">'
+            "<strong>Cobertura de leitura do contrato:</strong></span>"
+            f"{cov_badges}</div>"
+        )
+    for warn_msg in summary.reading_warnings:
+        render_banner("ai", "Leitura parcial do contrato", warn_msg)
+
     # 2. Tabela de Achados por Gravidade
     st.markdown("#### Achados priorizados por gravidade")
     if not summary.findings:
@@ -377,7 +483,8 @@ def _render_executive_report_section(
             expanded=False,
         ):
             for entry in summary.appendix_entries:
-                badge = render_badge(entry.tone, "•", entry.classification_label)
+                sev_prefix = f"{entry.severity_label} • " if entry.severity_label else ""
+                badge = render_badge(entry.tone, "•", f"{sev_prefix}{entry.classification_label}")
                 checks_html = "".join(
                     '<div style="margin-top:6px;">'
                     f"<strong>{escape_text(chk.check_label)}:</strong> "
@@ -449,11 +556,13 @@ def render_dashboard_view(conn: sqlite3.Connection) -> None:
             else "Todos os contratos"
         )
 
+    is_contract_scope = False
     if scope == "Contrato ativo" and active_contract is not None:
         active_invoices = [inv for inv in all_invoices if inv.contract_id == active_contract.id]
         if active_invoices:
             scoped_invoices = active_invoices
             scope_label = f"{active_contract.id} — {active_contract.supplier}"
+            is_contract_scope = True
         else:
             if all_invoices:
                 render_banner(
@@ -566,7 +675,27 @@ def render_dashboard_view(conn: sqlite3.Connection) -> None:
             st.rerun()
 
     doc_names = {doc.id: doc.file_name for doc in fetch_documents(conn)}
-    summary = build_executive_report(audited_items, doc_names=doc_names)
+    payment_scope_cid = (
+        active_contract.id if (is_contract_scope and active_contract is not None) else None
+    )
+    if is_contract_scope and active_contract is not None:
+        scope_contracts = [active_contract]
+        scope_rules = list(fetch_rules(conn, active_contract.id))
+    else:
+        referenced_cids = {
+            inv.contract_id for inv in scoped_invoices if inv.contract_id is not None
+        }
+        all_contracts = list(fetch_contracts(conn))
+        scope_contracts = [c for c in all_contracts if c.id in referenced_cids]
+        scope_rules = [rule for c in scope_contracts for rule in fetch_rules(conn, c.id)]
+    payment_audit = fetch_payment_cycle_audit(conn, payment_scope_cid)
+    summary = build_executive_report(
+        audited_items,
+        doc_names=doc_names,
+        payment_audit=payment_audit,
+        contracts=scope_contracts,
+        rules=scope_rules,
+    )
 
     counts: dict[AuditClassification, int] = {cls: 0 for cls in CLASSIFICATION_SEVERITY_ORDER}
     for _, stored in audited_items:
@@ -580,9 +709,9 @@ def render_dashboard_view(conn: sqlite3.Connection) -> None:
                 hint=f"{summary.clean_invoices_count} sem divergência",
             ),
             KpiItem(
-                "Exigem ação",
-                str(summary.findings_count),
-                hint=f"{summary.action_invoices_count} nota(s) envolvida(s)",
+                "Notas com ação",
+                str(summary.action_invoices_count),
+                hint=f"{summary.findings_count} achado(s) consolidado(s)",
             ),
             KpiItem(
                 "Exposição estimada",
@@ -615,13 +744,47 @@ def render_dashboard_view(conn: sqlite3.Connection) -> None:
             _build_competence_chart(summary.competence_rows, theme),
             theme=None,
             width="stretch",
-            alt="Comparativo entre valor vigente e valor cobrado por competência",
+            alt="Linha do tempo comparativa entre valor vigente e valor cobrado por competência",
             key="chart_competence_values",
         )
 
     st.divider()
-    _render_executive_report_section(
-        summary,
-        audited_items=audited_items,
-        scope_label=scope_label,
-    )
+    if len(summary.contract_sections) > 1:
+        verdict_items = "".join(
+            f"<li>{escape_text(line)}</li>" for line in summary.verdict_lines[:4]
+        )
+        st.subheader("Relatório Executivo Consolidado (por Contrato)")
+        st.html(
+            f'<div class="verdict-box {summary.verdict_tone}">'
+            f'<div class="verdict-headline">{escape_text(summary.verdict_headline)}</div>'
+            f'<ul class="verdict-list">{verdict_items}</ul>'
+            "</div>"
+        )
+        for sec in summary.contract_sections:
+            with st.container(border=True):
+                st.markdown(
+                    f"### Contrato {sec.contract.id} — {sec.contract.supplier} "
+                    f"({sec.contract.supplier_cnpj})"
+                )
+                if sec.summary.competence_rows:
+                    st.altair_chart(
+                        _build_competence_chart(sec.summary.competence_rows, theme),
+                        theme=None,
+                        width="stretch",
+                        alt=f"Linha do tempo de valores do contrato {sec.contract.id}",
+                        key=f"chart_timeline_sec_{sec.contract.id}",
+                    )
+                sec_items = [
+                    pair for pair in audited_items if pair[0].contract_id == sec.contract.id
+                ]
+                _render_executive_report_section(
+                    sec.summary,
+                    audited_items=sec_items,
+                    scope_label=f"{sec.contract.id} — {sec.contract.supplier}",
+                )
+    else:
+        _render_executive_report_section(
+            summary,
+            audited_items=audited_items,
+            scope_label=scope_label,
+        )

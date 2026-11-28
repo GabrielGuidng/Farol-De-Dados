@@ -16,6 +16,7 @@ from backend.api import (
     fetch_contracts,
     fetch_documents,
     fetch_invoices,
+    fetch_payment_cycle_audit,
     fetch_reviews,
     ingest_uploaded_files,
     record_audit_decision,
@@ -23,6 +24,7 @@ from backend.api import (
 from backend.persistencia import StoredAudit
 from backend.schemas import (
     AuditClassification,
+    Check,
     CheckResult,
     Contract,
     Document,
@@ -346,6 +348,7 @@ def _render_audit_card(
     doc_by_id: dict[str, Document],
     doc_names: dict[str, str],
     reviewer: str,
+    op_checks: tuple[Check, ...] = (),
 ) -> None:
     comp_short = format_competence_short(invoice.reference_period)
     contract_lbl = f"Contrato {invoice.contract_id}" if invoice.contract_id else "Sem vínculo"
@@ -434,7 +437,10 @@ def _render_audit_card(
     )
 
     checks_html_parts: list[str] = []
-    ordered_checks = sorted(result.checks, key=lambda c: _CHECK_SEVERITY_ORDER[c.result])
+    ordered_checks = sorted(
+        (*result.checks, *op_checks),
+        key=lambda c: _CHECK_SEVERITY_ORDER[c.result],
+    )
     for chk in ordered_checks:
         mem_html = ""
         if chk.calculation_memory:
@@ -915,13 +921,38 @@ def render_billing_audit_view(conn: sqlite3.Connection) -> None:
     reviewer = (
         str(st.session_state.get("reviewer_name", "auditor.local")).strip() or "auditor.local"
     )
+    target_payment_cid = (
+        active_contract.id
+        if active_contract is not None and scope_choice == _SCOPE_OPTIONS[0]
+        else None
+    )
+    payment_audit = fetch_payment_cycle_audit(conn, target_payment_cid)
+    global_payment_alerts = [
+        pf
+        for pf in payment_audit.findings
+        if pf.code.startswith("CERTIFICATE_") or pf.code.startswith("SUMMARY_")
+    ]
+    if global_payment_alerts:
+        summary_txt = " • ".join(pf.problem for pf in global_payment_alerts[:4])
+        render_banner(
+            "ai",
+            f"Alertas de certidões e reconciliação ({len(global_payment_alerts)})",
+            summary_txt,
+        )
 
     collapse_clean = len(filtered) > 3 and cls_choice == "Todas"
     clean_shown_header = False
 
     for inv, stored in filtered:
+        inv_op_checks = payment_audit.checks_by_invoice_number.get(
+            inv.number.strip().casefold(),
+            (),
+        )
+        has_op_issue = any(chk.result is not CheckResult.OK for chk in inv_op_checks)
         is_clean = (
-            stored is not None and stored.result.classification is AuditClassification.NO_DIVERGENCE
+            stored is not None
+            and stored.result.classification is AuditClassification.NO_DIVERGENCE
+            and not has_op_issue
         )
         if collapse_clean and is_clean:
             if not clean_shown_header:
@@ -941,6 +972,7 @@ def render_billing_audit_view(conn: sqlite3.Connection) -> None:
                     doc_by_id=doc_by_id,
                     doc_names=doc_names,
                     reviewer=reviewer,
+                    op_checks=inv_op_checks,
                 )
         else:
             _render_audit_card(
@@ -950,6 +982,7 @@ def render_billing_audit_view(conn: sqlite3.Connection) -> None:
                 doc_by_id=doc_by_id,
                 doc_names=doc_names,
                 reviewer=reviewer,
+                op_checks=inv_op_checks,
             )
 
     audits_by_id = {
