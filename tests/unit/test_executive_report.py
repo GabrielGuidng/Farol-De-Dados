@@ -6,13 +6,16 @@ from decimal import Decimal
 
 from openpyxl import load_workbook
 
+from backend.motor import PaymentCycleAuditResult, PaymentFinding
 from backend.motor.duplicates import DUPLICATE_CHECK
 from backend.persistencia import StoredAudit
 from backend.schemas import (
     AppliedRule,
     AuditClassification,
     AuditResult,
+    Contract,
     ContractRule,
+    ContractStatus,
     DivergenceDirection,
     Evidence,
     Invoice,
@@ -280,7 +283,7 @@ def test_executive_report_11_invoices_deduplicates_calculates_exposure_and_expor
     assert summary.action_invoices_count == 4
     assert summary.clean_invoices_count == 7
     assert summary.exposure_total == Decimal("52300.00")
-    assert "11 notas auditadas, 3 exigem ação" in summary.verdict_headline
+    assert "11 notas auditadas, 4 notas exigem ação (3 achados)" in summary.verdict_headline
     assert "R$ 52.300,00" in summary.verdict_headline
 
     assert [
@@ -387,3 +390,303 @@ def test_executive_report_counts_orphan_invoice_risk_and_handles_all_clean() -> 
     assert summary_clean.exposure_total == Decimal("0.00")
     assert summary_clean.verdict_tone == "ok"
     assert summary_clean.appendix_entries == ()
+
+
+def test_executive_report_uses_single_base_per_competence_and_direct_payment_exposure() -> None:
+    audited_items = [
+        _make_audited(
+            inv_id="i-03",
+            number="1031",
+            month=3,
+            total=Decimal("48500.00"),
+            classification=AuditClassification.NO_DIVERGENCE,
+            difference=Decimal("0.00"),
+            base=Decimal("48500.00"),
+            checks=_ok_checks(),
+        ),
+        _make_audited(
+            inv_id="i-07a",
+            number="1046",
+            month=7,
+            total=Decimal("48500.00"),
+            classification=AuditClassification.NEEDS_REVIEW,
+            difference=Decimal("0.00"),
+            base=Decimal("48500.00"),
+            checks=(
+                Check(
+                    name=DUPLICATE_CHECK,
+                    result=CheckResult.REVIEW,
+                    direction=DivergenceDirection.POSSIBLE_DIVERGENCE,
+                    message="Possível duplicidade: cobrança 1047 (i-07b).",
+                    calculation_memory=("cobrança 1047 (i-07b): mesma competência",),
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="i-07b",
+            number="1047",
+            month=7,
+            total=Decimal("48500.00"),
+            classification=AuditClassification.NEEDS_REVIEW,
+            difference=Decimal("0.00"),
+            base=Decimal("48500.00"),
+            checks=(
+                Check(
+                    name=DUPLICATE_CHECK,
+                    result=CheckResult.REVIEW,
+                    direction=DivergenceDirection.POSSIBLE_DIVERGENCE,
+                    message="Possível duplicidade: cobrança 1046 (i-07a).",
+                    calculation_memory=("cobrança 1046 (i-07a): mesma competência",),
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="i-08",
+            number="1049",
+            month=8,
+            total=Decimal("48500.00"),
+            classification=AuditClassification.MISSING_DOCUMENTATION,
+            difference=Decimal("0.00"),
+            base=Decimal("48500.00"),
+            checks=(
+                Check(
+                    name="contract_link",
+                    result=CheckResult.PENDING,
+                    message="O CNPJ (28.741.963/0001-68) possui dígito verificador inválido.",
+                ),
+                Check(
+                    name="monthly_price",
+                    result=CheckResult.OK,
+                    message="Valor cobrado de R$ 48.500,00 confere com a regra vigente.",
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="i-09",
+            number="1051",
+            month=9,
+            total=Decimal("52300.00"),
+            classification=AuditClassification.DIVERGENCE,
+            difference=Decimal("3800.00"),
+            base=Decimal("48500.00"),
+            checks=(
+                Check(
+                    name="monthly_price",
+                    result=CheckResult.DIVERGENCE,
+                    direction=DivergenceDirection.OVERCHARGE,
+                    message="Divergência no preço mensal: +R$ 3.800,00.",
+                ),
+                Check(
+                    name="unapproved_adjustment",
+                    result=CheckResult.DIVERGENCE,
+                    direction=DivergenceDirection.OVERCHARGE,
+                    message="Reajuste sem aditivo.",
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="i-10",
+            number="1055",
+            month=10,
+            total=Decimal("48500.00"),
+            classification=AuditClassification.DIVERGENCE,
+            difference=Decimal("0.00"),
+            base=Decimal("48500.00"),
+            checks=(
+                Check(
+                    name="inss_retention",
+                    result=CheckResult.DIVERGENCE,
+                    direction=DivergenceDirection.UNDERCHARGE,
+                    message="INSS retido a menor.",
+                    calculation_memory=("diferença na retenção = retido − esperado = -R$ 485,00",),
+                ),
+            ),
+        ),
+    ]
+    payment_audit = PaymentCycleAuditResult(
+        payment_orders_count=6,
+        certificates_count=2,
+        total_net_paid=Decimal("250000.00"),
+        findings=(
+            PaymentFinding(
+                code="PAYMENT_BENEFICIARY",
+                severity="Alta",
+                op_numbers=("2025/0690",),
+                invoice_numbers=("1031",),
+                competence_period=ReferencePeriod(year=2025, month=3),
+                problem="Pagamento efetuado a CNPJ/conta bancária de terceiro",
+                risk_amount=Decimal("42195.00"),
+                suggested_action="Apurar desvio de favorecido",
+            ),
+        ),
+    )
+    rep = build_executive_report(audited_items, payment_audit=payment_audit)
+    july = next(r for r in rep.competence_rows if r.period_iso == "2025-07")
+    assert july.expected_total == Decimal("48500.00")
+    assert july.charged_total == Decimal("97000.00")
+    assert july.difference_total == Decimal("48500.00")
+
+    august = next(r for r in rep.competence_rows if r.period_iso == "2025-08")
+    assert august.expected_total == Decimal("48500.00")
+    assert august.difference_total == Decimal("0.00")
+
+    # 5 competências × 48.500 = 242.500 vigente; 294.800 cobrado (+52.300)
+    assert rep.expected_total == Decimal("242500.00")
+    assert rep.charged_total == Decimal("294800.00")
+    # Exposição direta = 3.800 + 48.500 + 485 + 42.195 = 94.980
+    assert rep.exposure_total == Decimal("94980.00")
+
+
+def test_executive_report_groups_findings_separates_cnpjs_and_counts_out_of_validity_exposure() -> (
+    None
+):
+    contract = Contract(
+        id="CT-2025-880",
+        company="Órgão Contratante",
+        supplier="Fornecedor Alfa Ltda",
+        supplier_cnpj="00000000000191",
+        subject="Sustentação de sistemas",
+        validity=ValidityPeriod(),
+        comparison_tolerance=Decimal("0.00"),
+        status=ContractStatus.ACTIVE,
+    )
+    items = [
+        _make_audited(
+            inv_id="inv-8801",
+            number="8801",
+            month=3,
+            total=Decimal("10000.00"),
+            classification=AuditClassification.NO_DIVERGENCE,
+            difference=Decimal("0.00"),
+            base=Decimal("10000.00"),
+            contract_id=contract.id,
+            checks=_ok_checks(),
+        ),
+        _make_audited(
+            inv_id="inv-8815",
+            number="8815",
+            month=4,
+            total=Decimal("10000.00"),
+            classification=AuditClassification.MISSING_DOCUMENTATION,
+            difference=None,
+            base=None,
+            contract_id=contract.id,
+            checks=(
+                Check(
+                    name="contract_link",
+                    result=CheckResult.PENDING,
+                    message=(
+                        "Pendência documental: O CNPJ do fornecedor (28.741.963/0001-99) "
+                        "possui dígito verificador inválido (esperado final -65)."
+                    ),
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="inv-8830",
+            number="8830",
+            month=5,
+            total=Decimal("10000.00"),
+            classification=AuditClassification.MISSING_DOCUMENTATION,
+            difference=None,
+            base=None,
+            contract_id=contract.id,
+            checks=(
+                Check(
+                    name="contract_link",
+                    result=CheckResult.PENDING,
+                    message=(
+                        "Pendência documental: O CNPJ do emitente (28.741.963/0002-46) "
+                        "pertence a filial da contratada (mesma raiz, filial /0002 vs. /0001)."
+                    ),
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="inv-8831",
+            number="8831",
+            month=5,
+            total=Decimal("10000.00"),
+            classification=AuditClassification.MISSING_DOCUMENTATION,
+            difference=None,
+            base=None,
+            contract_id=contract.id,
+            checks=(
+                Check(
+                    name="contract_link",
+                    result=CheckResult.PENDING,
+                    message=(
+                        "Pendência documental: O CNPJ do emitente (28.741.963/0002-46) "
+                        "pertence a filial da contratada (mesma raiz, filial /0002 vs. /0001)."
+                    ),
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="inv-8890",
+            number="8890",
+            month=6,
+            total=Decimal("31096.00"),
+            classification=AuditClassification.MISSING_DOCUMENTATION,
+            difference=None,
+            base=None,
+            contract_id=contract.id,
+            checks=(
+                Check(
+                    name="contract_link",
+                    result=CheckResult.PENDING,
+                    message=(
+                        "Pendência documental: O CNPJ do emitente (33.000.167/0001-01) "
+                        "pertence a outro fornecedor diferente do contrato (28.741.963/0001-65)."
+                    ),
+                ),
+            ),
+        ),
+        _make_audited(
+            inv_id="inv-8895",
+            number="8895",
+            month=7,
+            total=Decimal("31096.00"),
+            classification=AuditClassification.NEEDS_REVIEW,
+            difference=None,
+            base=None,
+            contract_id=contract.id,
+            checks=(
+                Check(
+                    name="contract_validity",
+                    result=CheckResult.REVIEW,
+                    message="Competência fora da vigência do contrato.",
+                ),
+            ),
+        ),
+    ]
+
+    rep = build_executive_report(items, contracts=[contract], rules=[])
+    assert rep.total_invoices == 6
+    assert rep.clean_invoices_count == 1
+    assert rep.action_invoices_count == 5
+    # 8830 e 8831 agrupadas em 1 achado de filial -> 4 achados no total.
+    assert rep.findings_count == 4
+    assert "6 notas auditadas, 5 notas exigem ação (4 achados)" in rep.verdict_headline
+    # Exposição integral de 8890 (31.096) + 8895 (31.096) = 62.192,00
+    assert rep.exposure_total == Decimal("62192.00")
+
+    problems = [f.problem for f in rep.findings]
+    assert "CNPJ de fornecedor diferente do contrato" in problems
+    assert "Competência fora da vigência do contrato" in problems
+    assert "CNPJ com dígito verificador inválido" in problems
+    assert "Emitida por filial (CNPJ diferente da matriz)" in problems
+    filial_finding = next(f for f in rep.findings if "filial" in f.problem)
+    assert filial_finding.invoices_label == "8830 e 8831"
+
+    assert len(rep.reading_coverage) == 5
+    assert any("CNPJ da contratada" in w for w in rep.reading_warnings)
+    assert any("período de vigência" in w for w in rep.reading_warnings)
+    assert any("regra de preço mensal" in w for w in rep.reading_warnings)
+
+    html_out = build_printable_report_html(
+        rep,
+        scope_label="CT-2025-880",
+        generated_at_br="27/11/2026 22:00",
+    )
+    assert "Cobertura da Leitura do Contrato" in html_out
