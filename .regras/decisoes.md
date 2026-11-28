@@ -25,7 +25,12 @@ Situações possíveis: **Adotada**, **Prevista**, **Em aberto**, **Etapa poster
 | Estado `REJECTED` da regra | Adotada **(decisão)** | A revisão humana precisa poder rejeitar uma regra extraída. |
 | Competência fora da vigência | `NEEDS_REVIEW`, não `DIVERGENCE` **(decisão)** | Sem os documentos, não dá para distinguir cobrança indevida de prorrogação não enviada. Muda a cobrança 107 do cenário de desenvolvimento. |
 | Mudança de regra no meio da competência | `NEEDS_REVIEW` sem pró-rata **(decisão)** | Pró-rata fica fora da primeira versão. |
-| Limiar de 85% | Apenas para sinalizar e priorizar **(decisão)** | Nenhuma regra do Jurista é aceita automaticamente; o limiar também escalona vínculos do Tradutor. |
+| Limiar de 85% | Auto-aprovação para regras > 85% com revisão reversível **(decisão)** | Regras extraídas do contrato com confiança acima de 85% (`> 0.85`) são confirmadas automaticamente na ingestão (`sistema.auto` na trilha `reviews`), com aviso e possibilidade de alteração posterior (`Corrigir`/`Rejeitar`); para o Tradutor, o limiar continua escalonando vínculos para revisão humana. |
+| Preços por item / posto / Ata (`ITEM_PRICE`) | Adotada **(decisão)** | `ContractRule` suporta `RuleType.ITEM_PRICE` com `item_name` e `quantity_scope` (`MONTHLY` para postos mensais recorrentes, `TOTAL` para teto acumulado global de Ata de Registro de Preços). |
+| DANFEs de mercadoria (`competence_inferred` e `issue_date`) | Adotada **(decisão)** | DANFEs identificadas por fornecimento/AF derivam a competência da emissão sem travar `competence_inferred`; faturas emitidas após `effective_end` dentro do mês final são marcadas como `OUTSIDE_CONTRACT_VALIDITY`. |
+| Trava de segurança e alinhamento Resumo × Apêndice | Adotada **(decisão)** | `MID_PERIOD_CHANGE` reporta gravidade `Média` com exposição `n/a`; se 100% das notas (`>= 3`) de um contrato divergirem no mesmo campo cadastral, o relatório colapsa em alerta único de leitura sem somar o bruto à exposição. |
+| Leitura multimodal de PDF escaneado e transição de quantitativo | Adotada na demonstração **(decisão)** | Quando `pdfplumber` devolve `NO_TEXT` e `LLMClient` implementa `transcribe_pdf`, utiliza-se leitura multimodal página a página; em aditivos de acréscimo/supressão de postos (`de X para Y`), `anchoring.py` e `timeline.py` garantem que o novo total seja preservado e herdado em repactuações. |
+| Gráfico em linha da linha do tempo (`Painel` e `Vigência`) | Adotada **(decisão)** | `Painel e Relatório` compara `Valor vigente × Valor cobrado` em gráfico de linha com marcadores de divergência; `Regras e Vigência` exibe evolução em degrau (`step-after`) da vigência mensal e marcos de aditivos. |
 
 ## Dependências previstas (adicionar quando o passo chegar)
 
